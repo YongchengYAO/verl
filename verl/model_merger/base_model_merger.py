@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -303,7 +304,6 @@ class BaseModelMerger(ABC):
         if len(lora_params_names) == 0:
             return None
 
-        import json
         from typing import OrderedDict
 
         import peft
@@ -389,10 +389,9 @@ class BaseModelMerger(ABC):
 
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()
+        self.model_config.torch_dtype = torch.bfloat16
         with init_empty_weights():
-            model = auto_model_class.from_config(
-                self.model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
-            )
+            model = auto_model_class.from_config(self.model_config)
         model.to_empty(device="cpu")
         model = self.patch_model_generation_config(model)
 
@@ -406,6 +405,23 @@ class BaseModelMerger(ABC):
         model.save_pretrained(self.config.target_dir, state_dict=state_dict)
         del state_dict
         del model
+
+        # Patch config.json to reflect the actual saved weight dtype (bfloat16).
+        # "dtype" is the primary field read by HF from_pretrained(dtype="auto");
+        # "torch_dtype" is kept for backward compatibility (deprecated alias).
+        # Sub-configs (text_config, vision_config) are updated for consistency.
+        config_path = os.path.join(self.config.target_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                cfg = json.load(f)
+            cfg["dtype"] = "bfloat16"
+            cfg["torch_dtype"] = "bfloat16"
+            for sub in ("text_config", "vision_config"):
+                if sub in cfg and isinstance(cfg[sub], dict):
+                    cfg[sub]["dtype"] = "bfloat16"
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            print("Patched config.json: dtype=bfloat16 (top-level, text_config, vision_config)")
 
         processor = hf_processor(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
         tokenizer = hf_tokenizer(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)

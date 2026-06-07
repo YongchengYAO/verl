@@ -26,7 +26,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import numpy as np
-import ray
+
+try:
+    import ray
+except Exception:
+    # Ray may not be installed in lightweight debug environments; allow import to proceed
+    ray = None
 import tensordict
 import torch
 import torch.distributed

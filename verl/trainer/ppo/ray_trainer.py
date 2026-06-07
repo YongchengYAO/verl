@@ -58,7 +58,10 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    should_save_ckpt_esi,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
@@ -1523,6 +1526,10 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        for key in reward_extra_infos_dict:
+                            if key != "score":
+                                this_val = np.array(reward_extra_infos_dict[key])
+                                metrics.update({f"critic/rewards/{key}": np.mean(this_val)})
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1567,7 +1574,9 @@ class RayPPOTrainer:
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+                                from verl.utils.debug.metrics import (
+                                    calculate_debug_metrics,
+                                )
 
                                 metrics.update(calculate_debug_metrics(batch))
 
@@ -1610,7 +1619,9 @@ class RayPPOTrainer:
                             and "rollout_log_probs" in batch.batch
                             and not bypass_recomputing_logprobs  # Only in decoupled mode
                         ):
-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+                            from verl.trainer.ppo.rollout_corr_helper import (
+                                compute_rollout_correction_and_add_to_batch,
+                            )
 
                             # Compute IS weights, apply rejection sampling, compute metrics
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)

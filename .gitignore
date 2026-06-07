@@ -131,3 +131,22 @@ logs
 log
 outputs
 .history
+
+# temporary files
+tmp
+
+# vscode
+*/.vscode/*
+.vscode
+.vscode/settings.json
+
+
+*.whl.*
+*.whl
+.claude
+CLAUDE.md
+
+**/deprecated/*
+dev
+.dev
+dev-*

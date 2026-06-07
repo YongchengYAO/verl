@@ -211,7 +211,10 @@ class RLHFDataset(Dataset):
                             apply_kwargs["tools"] = self.tool_schemas
 
                         raw_prompt = self.processor.apply_chat_template(
-                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            **apply_kwargs,
                         )
                         images, videos, audios = self._process_multi_modal_info(
                             messages, self.image_patch_size, self.config
