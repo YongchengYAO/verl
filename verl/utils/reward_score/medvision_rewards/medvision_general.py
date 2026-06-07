@@ -18,6 +18,14 @@ from verl.utils.reward_score.medvision_rewards.reward_fn import (
     cal_MRE_reward,
     extract_last_k_nums,
 )
+from verl.utils.reward_score.medvision_rewards.medvision_tl import (
+    cal_process_reward_v2 as cal_tl_process_reward_v2,
+    cal_process_reward_v3 as cal_tl_process_reward_v3,
+)
+from verl.utils.reward_score.medvision_rewards.medvision_ad import (
+    cal_process_reward_v2 as cal_ad_process_reward_v2,
+    cal_process_reward_v3 as cal_ad_process_reward_v3,
+)
 
 
 # Tag helpers: strict tags (no spaces inside <>), flexible spaces between structures
@@ -282,5 +290,115 @@ def compute_score_gaussian_proxy(
     return {
         "score": reward,
         "format_reward": format_reward,
+        "answer_reward": answer_reward,
+    }
+
+
+def compute_score_exp_decay_PRxAnswer_v2(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info,
+):
+    """
+    Multi-task PRxAnswer reward using mean normalized L2 process reward for AD and TL.
+
+    Routes process reward based on ability:
+      - medvision-tl:              format + TL_process_v2 * answer
+      - medvision-angle/distance:  format + AD_process_v2 * answer
+      - medvision-detection:       format + answer  (no process reward)
+
+    Args:
+        data_source: The source of the data.
+        solution_str: The solution (completions).
+        ground_truth: The ground truth.
+        extra_info: Extra information including the 'ability' field.
+
+    Returns:
+        A dictionary containing the calculated rewards.
+    """
+    assert extra_info is not None, (
+        "[Error] extra_info cannot be None since we have injected the field 'ability' into "
+        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
+    )
+
+    ability = extra_info.get("ability")
+    format_reward = cal_format_reward(solution_str, **extra_info)
+    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+
+    if ability == "medvision-tl":
+        process_reward = cal_tl_process_reward_v2(
+            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+        )
+        score = format_reward + process_reward * answer_reward
+    elif ability in ["medvision-angle", "medvision-distance"]:
+        process_reward = cal_ad_process_reward_v2(
+            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+        )
+        score = format_reward + process_reward * answer_reward
+    else:
+        # medvision-detection: no process reward
+        process_reward = 0.0
+        score = format_reward + answer_reward
+
+    return {
+        "score": score,
+        "format_reward": format_reward,
+        "process_reward": process_reward,
+        "answer_reward": answer_reward,
+    }
+
+
+def compute_score_exp_decay_PRxAnswer_v3(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info,
+):
+    """
+    Multi-task PRxAnswer reward using max normalized L2 process reward for AD and TL.
+
+    Routes process reward based on ability:
+      - medvision-tl:              format + TL_process_v3 * answer
+      - medvision-angle/distance:  format + AD_process_v3 * answer
+      - medvision-detection:       format + answer  (no process reward)
+
+    Args:
+        data_source: The source of the data.
+        solution_str: The solution (completions).
+        ground_truth: The ground truth.
+        extra_info: Extra information including the 'ability' field.
+
+    Returns:
+        A dictionary containing the calculated rewards.
+    """
+    assert extra_info is not None, (
+        "[Error] extra_info cannot be None since we have injected the field 'ability' into "
+        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
+    )
+
+    ability = extra_info.get("ability")
+    format_reward = cal_format_reward(solution_str, **extra_info)
+    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+
+    if ability == "medvision-tl":
+        process_reward = cal_tl_process_reward_v3(
+            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+        )
+        score = format_reward + process_reward * answer_reward
+    elif ability in ["medvision-angle", "medvision-distance"]:
+        process_reward = cal_ad_process_reward_v3(
+            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+        )
+        score = format_reward + process_reward * answer_reward
+    else:
+        # medvision-detection: no process reward
+        process_reward = 0.0
+        score = format_reward + answer_reward
+
+    return {
+        "score": score,
+        "format_reward": format_reward,
+        "process_reward": process_reward,
         "answer_reward": answer_reward,
     }

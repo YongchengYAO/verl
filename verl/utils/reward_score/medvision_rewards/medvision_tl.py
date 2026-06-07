@@ -19,6 +19,8 @@ import numpy as np
 from verl.utils.reward_score.medvision_rewards.reward_fn import (
     cal_MAE_reward,
     cal_MRE_reward,
+    cal_norm_L2_max_reward,
+    cal_norm_L2_reward,
     extract_last_k_nums,
 )
 
@@ -342,6 +344,142 @@ def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", 
     return reward
 
 
+def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward using normalized L2 distance for localization steps.
+
+    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_reward instead of cal_MAE_reward.
+    Steps 3 & 4 (axis length estimation) are unchanged (cal_MRE_reward).
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+    """
+
+    # Step patterns: reasoning + answer
+    patterns_step = {}
+    for k in range(1, 5):
+        # NOTE: Use GROUP patterns to extract numeric values
+        patterns_step[k] = rf"{PATTERNS_STEP_REASONING[k]}\s*{PATTERNS_STEP_ANSWER_GROUP[k]}"
+    pattern_step1 = re.compile(patterns_step[1], re.DOTALL)
+    pattern_step2 = re.compile(patterns_step[2], re.DOTALL)
+    pattern_step3 = re.compile(patterns_step[3], re.DOTALL)
+    pattern_step4 = re.compile(patterns_step[4], re.DOTALL)
+
+    # NOTE:
+    # ------
+    # The landmark coordinates are in (w, h) format, not the conventional (h, w) format for image space indexing.
+    # Such conversion is achieved in the dataset building recipe from MedVision (https://github.com/YongchengYAO/MedVision)
+    # ------
+    # P1 and P2 are the major axis landmarks, P3 and P4 are the minor axis landmarks
+    gt_p1_wh = np.array(kwargs.get("landmark_P1_wh"))
+    gt_p2_wh = np.array(kwargs.get("landmark_P2_wh"))
+    gt_p3_wh = np.array(kwargs.get("landmark_P3_wh"))
+    gt_p4_wh = np.array(kwargs.get("landmark_P4_wh"))
+
+    # Extract ground truth coordinates
+    gt_string = ground_truth.strip()
+    gt_parts = [
+        part.strip()
+        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
+    ]
+    gt_float = [float(part) for part in gt_parts if part]
+
+    pred_major_wh = None
+    pred_minor_wh = None
+
+    try:
+        # NOTE: norm_L2 reward should be used for normalized coordinates (step 1 and step 2)
+        # NOTE: MRE reward should be used in length estimation (step 3 and step 4)
+
+        # --- parse step 1: Major Axis Endpoints
+        m1 = pattern_step1.search(solution)
+        if m1:
+            x1_major, y1_major, x2_major, y2_major = _to_float(m1.group(1), m1.group(2), m1.group(3), m1.group(4))
+            pred_major_wh = [
+                x1_major,
+                y1_major,
+                x2_major,
+                y2_major,
+            ]
+            # Calculate norm_L2 for both orderings of points (P1, P2) vs (P2, P1)
+            reward_s1 = max(
+                cal_norm_L2_reward(
+                    pred_major_wh,
+                    [gt_p1_wh[0], gt_p1_wh[1], gt_p2_wh[0], gt_p2_wh[1]],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_reward(
+                    pred_major_wh,
+                    [gt_p2_wh[0], gt_p2_wh[1], gt_p1_wh[0], gt_p1_wh[1]],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s1 = 0
+
+        # --- parse step 2: Minor Axis Endpoints
+        m2 = pattern_step2.search(solution)
+        if m2:
+            x1_minor, y1_minor, x2_minor, y2_minor = _to_float(m2.group(1), m2.group(2), m2.group(3), m2.group(4))
+            pred_minor_wh = [
+                x1_minor,
+                y1_minor,
+                x2_minor,
+                y2_minor,
+            ]
+            # Calculate norm_L2 for both orderings of points (P3, P4) vs (P4, P3)
+            reward_s2 = max(
+                cal_norm_L2_reward(
+                    pred_minor_wh,
+                    [gt_p3_wh[0], gt_p3_wh[1], gt_p4_wh[0], gt_p4_wh[1]],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_reward(
+                    pred_minor_wh,
+                    [gt_p4_wh[0], gt_p4_wh[1], gt_p3_wh[0], gt_p3_wh[1]],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s2 = 0
+
+        # --- parse step 3: Major Axis Length
+        m3 = pattern_step3.search(solution)
+        if m3:
+            major_axis_length = _to_float(m3.group(1))
+            reward_s3 = cal_MRE_reward(
+                [major_axis_length],
+                [gt_float[0]],
+                reward_mapping_func,
+            )  # gt_float[0] is the GT major axis length
+        else:
+            reward_s3 = 0
+
+        # --- parse step 4: Minor Axis Length
+        m4 = pattern_step4.search(solution)
+        if m4:
+            minor_axis_length = _to_float(m4.group(1))
+            reward_s4 = cal_MRE_reward(
+                [minor_axis_length],
+                [gt_float[1]],
+                reward_mapping_func,
+            )  # gt_float[1] is the GT minor axis length
+        else:
+            reward_s4 = 0
+
+        reward = np.mean([reward_s1, reward_s2, reward_s3, reward_s4])
+
+    except Exception as e:
+        print(f"Exception in cal_process_reward_v2: {e}")
+        reward = 0.0
+
+    return reward
+
+
 def cal_format_reward(solution, alpha=0.8):
     """
     Reward function that checks if the model response has a specific format.
@@ -478,6 +616,219 @@ def compute_score_exp_decay_PRxAnswer(
 
     format_reward = cal_format_reward(solution_str)
     process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    reward = format_reward + process_reward * answer_reward
+
+    return {
+        "score": reward,
+        "format_reward": format_reward,
+        "process_reward": process_reward,
+        "answer_reward": answer_reward,
+    }
+
+
+def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward using max normalized L2 distance for localization steps.
+
+    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_max_reward: the localization
+    error per step is the worst-case (max) per-point normalized L2 distance instead of the mean.
+    Steps 3 & 4 (axis length estimation) are unchanged (cal_MRE_reward).
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+    """
+
+    # Step patterns: reasoning + answer
+    patterns_step = {}
+    for k in range(1, 5):
+        # NOTE: Use GROUP patterns to extract numeric values
+        patterns_step[k] = rf"{PATTERNS_STEP_REASONING[k]}\s*{PATTERNS_STEP_ANSWER_GROUP[k]}"
+    pattern_step1 = re.compile(patterns_step[1], re.DOTALL)
+    pattern_step2 = re.compile(patterns_step[2], re.DOTALL)
+    pattern_step3 = re.compile(patterns_step[3], re.DOTALL)
+    pattern_step4 = re.compile(patterns_step[4], re.DOTALL)
+
+    # NOTE:
+    # ------
+    # The landmark coordinates are in (w, h) format, not the conventional (h, w) format for image space indexing.
+    # Such conversion is achieved in the dataset building recipe from MedVision (https://github.com/YongchengYAO/MedVision)
+    # ------
+    # P1 and P2 are the major axis landmarks, P3 and P4 are the minor axis landmarks
+    gt_p1_wh = np.array(kwargs.get("landmark_P1_wh"))
+    gt_p2_wh = np.array(kwargs.get("landmark_P2_wh"))
+    gt_p3_wh = np.array(kwargs.get("landmark_P3_wh"))
+    gt_p4_wh = np.array(kwargs.get("landmark_P4_wh"))
+
+    # Extract ground truth coordinates
+    gt_string = ground_truth.strip()
+    gt_parts = [
+        part.strip()
+        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
+    ]
+    gt_float = [float(part) for part in gt_parts if part]
+
+    pred_major_wh = None
+    pred_minor_wh = None
+
+    try:
+        # NOTE: norm_L2_max reward should be used for normalized coordinates (step 1 and step 2)
+        # NOTE: MRE reward should be used in length estimation (step 3 and step 4)
+
+        # --- parse step 1: Major Axis Endpoints
+        m1 = pattern_step1.search(solution)
+        if m1:
+            x1_major, y1_major, x2_major, y2_major = _to_float(m1.group(1), m1.group(2), m1.group(3), m1.group(4))
+            pred_major_wh = [
+                x1_major,
+                y1_major,
+                x2_major,
+                y2_major,
+            ]
+            # Calculate norm_L2_max for both orderings of points (P1, P2) vs (P2, P1)
+            reward_s1 = max(
+                cal_norm_L2_max_reward(
+                    pred_major_wh,
+                    [gt_p1_wh[0], gt_p1_wh[1], gt_p2_wh[0], gt_p2_wh[1]],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_max_reward(
+                    pred_major_wh,
+                    [gt_p2_wh[0], gt_p2_wh[1], gt_p1_wh[0], gt_p1_wh[1]],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s1 = 0
+
+        # --- parse step 2: Minor Axis Endpoints
+        m2 = pattern_step2.search(solution)
+        if m2:
+            x1_minor, y1_minor, x2_minor, y2_minor = _to_float(m2.group(1), m2.group(2), m2.group(3), m2.group(4))
+            pred_minor_wh = [
+                x1_minor,
+                y1_minor,
+                x2_minor,
+                y2_minor,
+            ]
+            # Calculate norm_L2_max for both orderings of points (P3, P4) vs (P4, P3)
+            reward_s2 = max(
+                cal_norm_L2_max_reward(
+                    pred_minor_wh,
+                    [gt_p3_wh[0], gt_p3_wh[1], gt_p4_wh[0], gt_p4_wh[1]],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_max_reward(
+                    pred_minor_wh,
+                    [gt_p4_wh[0], gt_p4_wh[1], gt_p3_wh[0], gt_p3_wh[1]],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s2 = 0
+
+        # --- parse step 3: Major Axis Length
+        m3 = pattern_step3.search(solution)
+        if m3:
+            major_axis_length = _to_float(m3.group(1))
+            reward_s3 = cal_MRE_reward(
+                [major_axis_length],
+                [gt_float[0]],
+                reward_mapping_func,
+            )  # gt_float[0] is the GT major axis length
+        else:
+            reward_s3 = 0
+
+        # --- parse step 4: Minor Axis Length
+        m4 = pattern_step4.search(solution)
+        if m4:
+            minor_axis_length = _to_float(m4.group(1))
+            reward_s4 = cal_MRE_reward(
+                [minor_axis_length],
+                [gt_float[1]],
+                reward_mapping_func,
+            )  # gt_float[1] is the GT minor axis length
+        else:
+            reward_s4 = 0
+
+        reward = np.mean([reward_s1, reward_s2, reward_s3, reward_s4])
+
+    except Exception as e:
+        print(f"Exception in cal_process_reward_v3: {e}")
+        reward = 0.0
+
+    return reward
+
+
+def compute_score_exp_decay_PRxAnswer_v2(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+):
+    """
+    Variant of compute_score_exp_decay_PRxAnswer using normalized L2 process reward.
+
+    Identical to compute_score_exp_decay_PRxAnswer except the process reward uses
+    cal_process_reward_v2, which measures localization error via normalized L2 distance
+    (sqrt(dx^2+dy^2)/sqrt(2)) instead of MAE.
+
+    Args:
+        data_source: The source of the data.
+        solution_str: The solution (completions).
+        ground_truth: The ground truth.
+        extra_info: Extra information for reward calculation.
+
+    Returns:
+        A dictionary containing the calculated rewards.
+    """
+    if extra_info is None:
+        extra_info = {}
+
+    format_reward = cal_format_reward(solution_str)
+    process_reward = cal_process_reward_v2(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    reward = format_reward + process_reward * answer_reward
+
+    return {
+        "score": reward,
+        "format_reward": format_reward,
+        "process_reward": process_reward,
+        "answer_reward": answer_reward,
+    }
+
+
+def compute_score_exp_decay_PRxAnswer_v3(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+):
+    """
+    Variant of compute_score_exp_decay_PRxAnswer using max normalized L2 process reward.
+
+    Identical to compute_score_exp_decay_PRxAnswer except the process reward uses
+    cal_process_reward_v3, which measures localization error via the max (worst-case)
+    per-point normalized L2 distance instead of the mean.
+
+    Args:
+        data_source: The source of the data.
+        solution_str: The solution (completions).
+        ground_truth: The ground truth.
+        extra_info: Extra information for reward calculation.
+
+    Returns:
+        A dictionary containing the calculated rewards.
+    """
+    if extra_info is None:
+        extra_info = {}
+
+    format_reward = cal_format_reward(solution_str)
+    process_reward = cal_process_reward_v3(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
     answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
     reward = format_reward + process_reward * answer_reward
 

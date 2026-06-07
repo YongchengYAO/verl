@@ -27,7 +27,7 @@ fi
 
 
 # Define experiment name
-exp_name="medvision__fullRFT__qwen25vl-7b-fullSFT__AD-TL__512x512__PRxAnswer"
+exp_name="medvision__fullRFT__qwen25vl-7b-fullSFT__multiTask__512x512__PRxAnswer__normL2-max"
 
 # Define directories (derived from this script's location: examples/grpo_trainer/ -> repo root is two levels up)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,20 +40,21 @@ default_local_dir=$workspace_root/checkpoints/medvision_multi_tasks/$exp_name
 
 # Data
 # Check MedVision on how to prepare the verl datasets: https://github.com/YongchengYAO/MedVision
-# This script expects dataset variant: ds__AD0_D0_TL5500_all5500__resized-hw-512x512
+# This script expects dataset variant: ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512
 dataset_root="${DATASET_ROOT:?Set DATASET_ROOT to your prepared verl dataset directory (see https://github.com/YongchengYAO/MedVision)}"
-dataset_train=$dataset_root/train_verl.parquet
+dataset_train=$dataset_root/shards/train_shard_*.parquet
 dataset_val=$dataset_root/validation_verl.parquet
 
-# Model: HF model id or local checkpoint path (this stage continues from the AD RFT checkpoint)
+# Model: HF model id or local checkpoint path (this stage continues from the AD-TL RFT checkpoint)
 base_model_hf="${BASE_MODEL:?Set BASE_MODEL to a HF model id or local checkpoint path}"
 
 # Training
-epoch=100
+epoch=10
 
 # (Optional) Custom reward function
-reward_function_path=$verl_dir/verl/utils/reward_score/medvision_rewards/medvision_tl.py
-reward_function_name=compute_score_exp_decay_PRxAnswer_v2
+# process reward: max normalized L2 distance for AD/TL localization steps; no process reward for detection
+reward_function_path=$verl_dir/verl/utils/reward_score/medvision_rewards/medvision_general.py
+reward_function_name=compute_score_exp_decay_PRxAnswer_v3
 
 # (Optional) Custom dataset class
 custom_cls_path=$verl_dir/verl/utils/dataset/medvision_dataset.py
@@ -123,6 +124,7 @@ export CUDA_HOME="$CONDA_PREFIX"
 
 # 4x H200 (140 GB) full finetuning settings
 if [ "$DRY_RUN" != "1" ]; then
+    export RAY_memory_usage_threshold=0.98
     python3 -m verl.trainer.main_ppo \
         algorithm.adv_estimator=grpo \
         data.train_files=$dataset_train \
@@ -166,7 +168,7 @@ if [ "$DRY_RUN" != "1" ]; then
         trainer.experiment_name=$exp_name \
         trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
-        trainer.save_freq=50 \
+        trainer.save_freq=10 \
         trainer.test_freq=10 \
         trainer.total_epochs=$epoch \
         trainer.default_local_dir=$default_local_dir \

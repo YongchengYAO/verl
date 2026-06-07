@@ -19,6 +19,8 @@ import numpy as np
 from verl.utils.reward_score.medvision_rewards.reward_fn import (
     cal_MAE_reward,
     cal_MRE_reward,
+    cal_norm_L2_max_reward,
+    cal_norm_L2_reward,
     extract_last_k_nums,
 )
 
@@ -601,6 +603,500 @@ def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", 
         raise ValueError(f"Unsupported metric_type: {metric_type}")
 
 
+def cal_process_reward_distance_task_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward_distance_task using normalized L2 distance for localization steps.
+
+    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_reward instead of cal_MAE_reward.
+    Step 3 (distance estimation) is unchanged (cal_MRE_reward).
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+
+    NOTE:
+        - The number of reasoning steps is hardcoded, see "pattern_step{1,2,3}"
+        - The number of reasoning steps below is defined in COT_INSTRUCT_DISTANCE
+          imported from medvision_bm.sft.sft_prompts
+    """
+    # Step patterns: reasoning + answer
+    patterns_step = {}
+    for k in range(1, 4):
+        # NOTE: Use GROUP patterns to extract numeric values
+        patterns_step[k] = rf"{PATTERNS_STEP_REASONING_DISTANCE[k]}\s*{PATTERNS_STEP_ANSWER_DISTANCE_GROUP[k]}"
+    pattern_step1 = re.compile(patterns_step[1], re.DOTALL)
+    pattern_step2 = re.compile(patterns_step[2], re.DOTALL)
+    pattern_step3 = re.compile(patterns_step[3], re.DOTALL)
+
+    # NOTE:
+    # ------
+    # The landmark coordinates are in (w, h) format, not the conventional (h, w) format for image space indexing.
+    # Such conversion is achieved in the dataset building recipe from MedVision (https://github.com/YongchengYAO/MedVision)
+    # ------
+    gt_lm1_wh = np.array(kwargs.get("landmark_1_wh"))
+    gt_lm2_wh = np.array(kwargs.get("landmark_2_wh"))
+
+    # Extract ground truth coordinates
+    gt_string = ground_truth.strip()
+    gt_parts = [
+        part.strip()
+        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
+    ]
+    gt_float = [float(part) for part in gt_parts if part]
+
+    try:
+        # NOTE: norm_L2 reward should be used for normalized coordinates (step 1 and step 2)
+        # NOTE: MRE reward should be used in distance estimation (step 3)
+
+        # --- parse step 1: landmark 1 coordinate
+        m1 = pattern_step1.search(solution)
+        if m1:
+            pred_lm1_wh = list(_to_float(m1.group(1), m1.group(2)))
+            reward_s1 = cal_norm_L2_reward(
+                pred_lm1_wh,
+                [gt_lm1_wh[0], gt_lm1_wh[1]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s1 = 0
+
+        # --- parse step 2: landmark 2 coordinate
+        m2 = pattern_step2.search(solution)
+        if m2:
+            pred_lm2_wh = list(_to_float(m2.group(1), m2.group(2)))
+            reward_s2 = cal_norm_L2_reward(
+                pred_lm2_wh,
+                [gt_lm2_wh[0], gt_lm2_wh[1]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s2 = 0
+
+        # --- parse step 3: the target distance
+        m3 = pattern_step3.search(solution)
+        if m3:
+            pred_distance = list(_to_float(m3.group(1)))
+            reward_s3 = cal_MRE_reward(
+                pred_distance,
+                [gt_float[0]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s3 = 0
+
+        reward = np.mean([reward_s1, reward_s2, reward_s3])
+
+    except Exception as e:
+        print(f"Exception in cal_process_reward_distance_task_v2: {e}")
+        reward = 0.0
+
+    return reward
+
+
+def cal_process_reward_angle_task_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward_angle_task using normalized L2 distance for localization steps.
+
+    Steps 1 & 2 (line endpoint prediction) use cal_norm_L2_reward instead of cal_MAE_reward.
+    Step 3 (angle estimation) is unchanged (cal_MRE_reward).
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+
+    NOTE:
+        - The number of reasoning steps is hardcoded, see "pattern_step{1,2,3}"
+        - The number of reasoning steps below is defined in COT_INSTRUCT_ANGLE
+          imported from medvision_bm.sft.sft_prompts
+    """
+    # Step patterns: reasoning + answer
+    patterns_step = {}
+    for k in range(1, 4):
+        # NOTE: Use GROUP patterns to extract numeric values
+        patterns_step[k] = rf"{PATTERNS_STEP_REASONING_ANGLE[k]}\s*{PATTERNS_STEP_ANSWER_ANGLE_GROUP[k]}"
+    pattern_step1 = re.compile(patterns_step[1], re.DOTALL)
+    pattern_step2 = re.compile(patterns_step[2], re.DOTALL)
+    pattern_step3 = re.compile(patterns_step[3], re.DOTALL)
+
+    # NOTE:
+    # ------
+    # The landmark coordinates are in (w, h) format, not the conventional (h, w) format for image space indexing.
+    # Such conversion is achieved in the dataset building recipe from MedVision (https://github.com/YongchengYAO/MedVision)
+    # ------
+    gt_lm1_line1_wh = np.array(kwargs.get("line_1_point_1_wh"))
+    gt_lm2_line1_wh = np.array(kwargs.get("line_1_point_2_wh"))
+    gt_lm1_line2_wh = np.array(kwargs.get("line_2_point_1_wh"))
+    gt_lm2_line2_wh = np.array(kwargs.get("line_2_point_2_wh"))
+
+    # Extract ground truth coordinates
+    gt_string = ground_truth.strip()
+    gt_parts = [
+        part.strip()
+        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
+    ]
+    gt_float = [float(part) for part in gt_parts if part]
+
+    try:
+        # NOTE: norm_L2 reward should be used for normalized coordinates (step 1 and step 2)
+        # NOTE: MRE reward should be used in angle estimation (step 3)
+
+        # --- parse step 1: line 1 endpoints
+        m1 = pattern_step1.search(solution)
+        if m1:
+            pred_line1_coor_wh = list(_to_float(m1.group(1), m1.group(2), m1.group(3), m1.group(4)))
+            # Calculate norm_L2 for both orderings of points (P1, P2) vs (P2, P1)
+            reward_s1 = max(
+                cal_norm_L2_reward(
+                    pred_line1_coor_wh,
+                    [
+                        gt_lm1_line1_wh[0],
+                        gt_lm1_line1_wh[1],
+                        gt_lm2_line1_wh[0],
+                        gt_lm2_line1_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_reward(
+                    pred_line1_coor_wh,
+                    [
+                        gt_lm2_line1_wh[0],
+                        gt_lm2_line1_wh[1],
+                        gt_lm1_line1_wh[0],
+                        gt_lm1_line1_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s1 = 0
+
+        # --- parse step 2: line 2 endpoints
+        m2 = pattern_step2.search(solution)
+        if m2:
+            pred_line2_coor_wh = list(_to_float(m2.group(1), m2.group(2), m2.group(3), m2.group(4)))
+            # Calculate norm_L2 for both orderings of points (P1, P2) vs (P2, P1)
+            reward_s2 = max(
+                cal_norm_L2_reward(
+                    pred_line2_coor_wh,
+                    [
+                        gt_lm1_line2_wh[0],
+                        gt_lm1_line2_wh[1],
+                        gt_lm2_line2_wh[0],
+                        gt_lm2_line2_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_reward(
+                    pred_line2_coor_wh,
+                    [
+                        gt_lm2_line2_wh[0],
+                        gt_lm2_line2_wh[1],
+                        gt_lm1_line2_wh[0],
+                        gt_lm1_line2_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s2 = 0
+
+        # --- parse step 3: the target angle
+        m3 = pattern_step3.search(solution)
+        if m3:
+            pred_angle = list(_to_float(m3.group(1)))
+            reward_s3 = cal_MRE_reward(
+                pred_angle,
+                [gt_float[0]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s3 = 0
+
+        reward = np.mean([reward_s1, reward_s2, reward_s3])
+
+    except Exception as e:
+        print(f"Exception in cal_process_reward_angle_task_v2: {e}")
+        reward = 0.0
+
+    return reward
+
+
+def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward dispatching to the normalized L2 localization variants.
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+    """
+    metric_type = kwargs.get("metric_type", None)
+    assert metric_type is not None, "metric_type not found in kwargs"
+
+    if metric_type == "distance":
+        return cal_process_reward_distance_task_v2(solution, ground_truth, reward_mapping_func, **kwargs)
+    elif metric_type == "angle":
+        return cal_process_reward_angle_task_v2(solution, ground_truth, reward_mapping_func, **kwargs)
+    else:
+        raise ValueError(f"Unsupported metric_type: {metric_type}")
+
+
+def cal_process_reward_distance_task_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward_distance_task_v2 using max normalized L2 distance.
+
+    Steps 1 & 2 use cal_norm_L2_max_reward instead of cal_norm_L2_reward.
+    For single-point steps (distance task), v2 and v3 are numerically identical.
+    Step 3 (distance estimation) is unchanged (cal_MRE_reward).
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+
+    NOTE:
+        - The number of reasoning steps is hardcoded, see "pattern_step{1,2,3}"
+        - The number of reasoning steps below is defined in COT_INSTRUCT_DISTANCE
+          imported from medvision_bm.sft.sft_prompts
+    """
+    # Step patterns: reasoning + answer
+    patterns_step = {}
+    for k in range(1, 4):
+        # NOTE: Use GROUP patterns to extract numeric values
+        patterns_step[k] = rf"{PATTERNS_STEP_REASONING_DISTANCE[k]}\s*{PATTERNS_STEP_ANSWER_DISTANCE_GROUP[k]}"
+    pattern_step1 = re.compile(patterns_step[1], re.DOTALL)
+    pattern_step2 = re.compile(patterns_step[2], re.DOTALL)
+    pattern_step3 = re.compile(patterns_step[3], re.DOTALL)
+
+    # NOTE:
+    # ------
+    # The landmark coordinates are in (w, h) format, not the conventional (h, w) format for image space indexing.
+    # Such conversion is achieved in the dataset building recipe from MedVision (https://github.com/YongchengYAO/MedVision)
+    # ------
+    gt_lm1_wh = np.array(kwargs.get("landmark_1_wh"))
+    gt_lm2_wh = np.array(kwargs.get("landmark_2_wh"))
+
+    # Extract ground truth coordinates
+    gt_string = ground_truth.strip()
+    gt_parts = [
+        part.strip()
+        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
+    ]
+    gt_float = [float(part) for part in gt_parts if part]
+
+    try:
+        # NOTE: norm_L2_max reward should be used for normalized coordinates (step 1 and step 2)
+        # NOTE: MRE reward should be used in distance estimation (step 3)
+
+        # --- parse step 1: landmark 1 coordinate
+        m1 = pattern_step1.search(solution)
+        if m1:
+            pred_lm1_wh = list(_to_float(m1.group(1), m1.group(2)))
+            reward_s1 = cal_norm_L2_max_reward(
+                pred_lm1_wh,
+                [gt_lm1_wh[0], gt_lm1_wh[1]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s1 = 0
+
+        # --- parse step 2: landmark 2 coordinate
+        m2 = pattern_step2.search(solution)
+        if m2:
+            pred_lm2_wh = list(_to_float(m2.group(1), m2.group(2)))
+            reward_s2 = cal_norm_L2_max_reward(
+                pred_lm2_wh,
+                [gt_lm2_wh[0], gt_lm2_wh[1]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s2 = 0
+
+        # --- parse step 3: the target distance
+        m3 = pattern_step3.search(solution)
+        if m3:
+            pred_distance = list(_to_float(m3.group(1)))
+            reward_s3 = cal_MRE_reward(
+                pred_distance,
+                [gt_float[0]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s3 = 0
+
+        reward = np.mean([reward_s1, reward_s2, reward_s3])
+
+    except Exception as e:
+        print(f"Exception in cal_process_reward_distance_task_v3: {e}")
+        reward = 0.0
+
+    return reward
+
+
+def cal_process_reward_angle_task_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward_angle_task_v2 using max normalized L2 distance.
+
+    Steps 1 & 2 use cal_norm_L2_max_reward: reward per step is determined by the
+    worst-localized endpoint (max per-point distance) instead of the mean.
+    Step 3 (angle estimation) is unchanged (cal_MRE_reward).
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+
+    NOTE:
+        - The number of reasoning steps is hardcoded, see "pattern_step{1,2,3}"
+        - The number of reasoning steps below is defined in COT_INSTRUCT_ANGLE
+          imported from medvision_bm.sft.sft_prompts
+    """
+    # Step patterns: reasoning + answer
+    patterns_step = {}
+    for k in range(1, 4):
+        # NOTE: Use GROUP patterns to extract numeric values
+        patterns_step[k] = rf"{PATTERNS_STEP_REASONING_ANGLE[k]}\s*{PATTERNS_STEP_ANSWER_ANGLE_GROUP[k]}"
+    pattern_step1 = re.compile(patterns_step[1], re.DOTALL)
+    pattern_step2 = re.compile(patterns_step[2], re.DOTALL)
+    pattern_step3 = re.compile(patterns_step[3], re.DOTALL)
+
+    # NOTE:
+    # ------
+    # The landmark coordinates are in (w, h) format, not the conventional (h, w) format for image space indexing.
+    # Such conversion is achieved in the dataset building recipe from MedVision (https://github.com/YongchengYAO/MedVision)
+    # ------
+    gt_lm1_line1_wh = np.array(kwargs.get("line_1_point_1_wh"))
+    gt_lm2_line1_wh = np.array(kwargs.get("line_1_point_2_wh"))
+    gt_lm1_line2_wh = np.array(kwargs.get("line_2_point_1_wh"))
+    gt_lm2_line2_wh = np.array(kwargs.get("line_2_point_2_wh"))
+
+    # Extract ground truth coordinates
+    gt_string = ground_truth.strip()
+    gt_parts = [
+        part.strip()
+        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
+    ]
+    gt_float = [float(part) for part in gt_parts if part]
+
+    try:
+        # NOTE: norm_L2_max reward should be used for normalized coordinates (step 1 and step 2)
+        # NOTE: MRE reward should be used in angle estimation (step 3)
+
+        # --- parse step 1: line 1 endpoints
+        m1 = pattern_step1.search(solution)
+        if m1:
+            pred_line1_coor_wh = list(_to_float(m1.group(1), m1.group(2), m1.group(3), m1.group(4)))
+            # Calculate norm_L2_max for both orderings of points (P1, P2) vs (P2, P1)
+            reward_s1 = max(
+                cal_norm_L2_max_reward(
+                    pred_line1_coor_wh,
+                    [
+                        gt_lm1_line1_wh[0],
+                        gt_lm1_line1_wh[1],
+                        gt_lm2_line1_wh[0],
+                        gt_lm2_line1_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_max_reward(
+                    pred_line1_coor_wh,
+                    [
+                        gt_lm2_line1_wh[0],
+                        gt_lm2_line1_wh[1],
+                        gt_lm1_line1_wh[0],
+                        gt_lm1_line1_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s1 = 0
+
+        # --- parse step 2: line 2 endpoints
+        m2 = pattern_step2.search(solution)
+        if m2:
+            pred_line2_coor_wh = list(_to_float(m2.group(1), m2.group(2), m2.group(3), m2.group(4)))
+            # Calculate norm_L2_max for both orderings of points (P1, P2) vs (P2, P1)
+            reward_s2 = max(
+                cal_norm_L2_max_reward(
+                    pred_line2_coor_wh,
+                    [
+                        gt_lm1_line2_wh[0],
+                        gt_lm1_line2_wh[1],
+                        gt_lm2_line2_wh[0],
+                        gt_lm2_line2_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+                cal_norm_L2_max_reward(
+                    pred_line2_coor_wh,
+                    [
+                        gt_lm2_line2_wh[0],
+                        gt_lm2_line2_wh[1],
+                        gt_lm1_line2_wh[0],
+                        gt_lm1_line2_wh[1],
+                    ],
+                    reward_mapping_func,
+                ),
+            )
+        else:
+            reward_s2 = 0
+
+        # --- parse step 3: the target angle
+        m3 = pattern_step3.search(solution)
+        if m3:
+            pred_angle = list(_to_float(m3.group(1)))
+            reward_s3 = cal_MRE_reward(
+                pred_angle,
+                [gt_float[0]],
+                reward_mapping_func,
+            )
+        else:
+            reward_s3 = 0
+
+        reward = np.mean([reward_s1, reward_s2, reward_s3])
+
+    except Exception as e:
+        print(f"Exception in cal_process_reward_angle_task_v3: {e}")
+        reward = 0.0
+
+    return reward
+
+
+def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward dispatching to the max normalized L2 localization variants.
+
+    Args:
+        solution: model responses (text)
+        ground_truth: ground truth string.
+
+    Returns:
+        a scalar reward
+    """
+    metric_type = kwargs.get("metric_type", None)
+    assert metric_type is not None, "metric_type not found in kwargs"
+
+    if metric_type == "distance":
+        return cal_process_reward_distance_task_v3(solution, ground_truth, reward_mapping_func, **kwargs)
+    elif metric_type == "angle":
+        return cal_process_reward_angle_task_v3(solution, ground_truth, reward_mapping_func, **kwargs)
+    else:
+        raise ValueError(f"Unsupported metric_type: {metric_type}")
+
+
 def cal_format_reward(solution, alpha=0.8, **kwargs):
     """
     Reward function that checks if the model response has a specific format.
@@ -737,6 +1233,82 @@ def compute_score_exp_decay_PRxAnswer(
 
     format_reward = cal_format_reward(solution_str, **extra_info)
     process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    reward = format_reward + process_reward * answer_reward
+
+    return {
+        "score": reward,
+        "format_reward": format_reward,
+        "process_reward": process_reward,
+        "answer_reward": answer_reward,
+    }
+
+
+def compute_score_exp_decay_PRxAnswer_v2(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+):
+    """
+    Variant of compute_score_exp_decay_PRxAnswer using normalized L2 process reward.
+
+    Identical to compute_score_exp_decay_PRxAnswer except the process reward uses
+    cal_process_reward_v2, which measures localization error via normalized L2 distance
+    (sqrt(dx^2+dy^2)/sqrt(2)) instead of MAE.
+
+    Args:
+        data_source: The source of the data.
+        solution_str: The solution (completions).
+        ground_truth: The ground truth.
+        extra_info: Extra information for reward calculation.
+
+    Returns:
+        A dictionary containing the calculated rewards.
+    """
+    if extra_info is None:
+        extra_info = {}
+
+    format_reward = cal_format_reward(solution_str, **extra_info)
+    process_reward = cal_process_reward_v2(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    reward = format_reward + process_reward * answer_reward
+
+    return {
+        "score": reward,
+        "format_reward": format_reward,
+        "process_reward": process_reward,
+        "answer_reward": answer_reward,
+    }
+
+
+def compute_score_exp_decay_PRxAnswer_v3(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+):
+    """
+    Variant of compute_score_exp_decay_PRxAnswer using max normalized L2 process reward.
+
+    Identical to compute_score_exp_decay_PRxAnswer except the process reward uses
+    cal_process_reward_v3, which measures localization error via the max (worst-case)
+    per-point normalized L2 distance instead of the mean.
+
+    Args:
+        data_source: The source of the data.
+        solution_str: The solution (completions).
+        ground_truth: The ground truth.
+        extra_info: Extra information for reward calculation.
+
+    Returns:
+        A dictionary containing the calculated rewards.
+    """
+    if extra_info is None:
+        extra_info = {}
+
+    format_reward = cal_format_reward(solution_str, **extra_info)
+    process_reward = cal_process_reward_v3(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
     answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
     reward = format_reward + process_reward * answer_reward
 
