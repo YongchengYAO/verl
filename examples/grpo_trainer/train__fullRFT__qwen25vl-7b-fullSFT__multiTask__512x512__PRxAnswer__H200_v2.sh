@@ -42,7 +42,11 @@ default_local_dir=$workspace_root/checkpoints/medvision_multi_tasks/$exp_name
 # Check MedVision on how to prepare the verl datasets: https://github.com/YongchengYAO/MedVision
 # This script expects dataset variant: ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512
 dataset_root="${DATASET_ROOT:?Set DATASET_ROOT to your prepared verl dataset directory (see https://github.com/YongchengYAO/MedVision)}"
-dataset_train=$dataset_root/shards/train_shard_*.parquet
+if ls "$dataset_root/shards/"train_shard_*.parquet 1>/dev/null 2>&1; then
+    dataset_train="$dataset_root/shards/train_shard_*.parquet"
+else
+    dataset_train="$dataset_root/train_verl.parquet"
+fi
 dataset_val=$dataset_root/validation_verl.parquet
 
 # Model: HF model id or local checkpoint path (this stage continues from the AD-TL RFT checkpoint)
@@ -175,7 +179,7 @@ if [ "$DRY_RUN" != "1" ]; then
         trainer.validation_data_dir=$validation_data_dir \
         custom_reward_function.path=$reward_function_path \
         custom_reward_function.name=$reward_function_name \
-        reward_model.use_reward_loop=True \
+        +reward_model.use_reward_loop=True \
         data.custom_cls.path=$custom_cls_path \
         data.custom_cls.name=$custom_cls_name \
         $@

@@ -27,7 +27,7 @@ fi
 
 
 # Define experiment name
-exp_name="medvision__fullRFT__qwen25vl-7b-fullSFT__AD-TL-D__512x512__PRxAnswer"
+exp_name="medvision__fullRFT__qwen25vl-7b-fullSFT__multiTask__512x512__PRxAnswer__normL2-mean"
 
 # Define directories (derived from this script's location: examples/grpo_trainer/ -> repo root is two levels up)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,8 +56,9 @@ base_model_hf="${BASE_MODEL:?Set BASE_MODEL to a HF model id or local checkpoint
 epoch=10
 
 # (Optional) Custom reward function
+# process reward: mean normalized L2 distance for AD/TL localization steps; no process reward for detection
 reward_function_path=$verl_dir/verl/utils/reward_score/medvision_rewards/medvision_general.py
-reward_function_name=compute_score_exp_decay
+reward_function_name=compute_score_exp_decay_PRxAnswer_v2
 
 # (Optional) Custom dataset class
 custom_cls_path=$verl_dir/verl/utils/dataset/medvision_dataset.py
@@ -125,7 +126,12 @@ export CUDA_HOME="$CONDA_PREFIX"
 # trainer.max_actor_ckpt_to_keep=5 \
 
 
-# 4x H200 (140 GB) full finetuning settings
+# 4x H100 (80 GB) full finetuning settings
+# Differences from the H200 variant:
+#   ppo_micro_batch_size_per_gpu:        4 -> 2  (less activation memory per GPU)
+#   rollout.log_prob_micro_batch_size_per_gpu: 4 -> 2
+#   ref.log_prob_micro_batch_size_per_gpu:     4 -> 2
+#   gpu_memory_utilization:              0.55 -> 0.50  (less absolute VRAM headroom)
 if [ "$DRY_RUN" != "1" ]; then
     export RAY_memory_usage_threshold=0.98
     python3 -m verl.trainer.main_ppo \
@@ -142,7 +148,7 @@ if [ "$DRY_RUN" != "1" ]; then
         actor_rollout_ref.actor.optim.lr=3e-6 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
         actor_rollout_ref.actor.use_kl_loss=True \
         actor_rollout_ref.actor.kl_loss_coef=0.01 \
         actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -151,18 +157,18 @@ if [ "$DRY_RUN" != "1" ]; then
         actor_rollout_ref.actor.fsdp_config.param_offload=False \
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
         actor_rollout_ref.actor.checkpoint.save_contents=['model','optimizer','extra'] \
-        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
         actor_rollout_ref.rollout.name=$ENGINE \
         +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
-        actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.50 \
         actor_rollout_ref.rollout.enable_chunked_prefill=False \
         actor_rollout_ref.rollout.enforce_eager=False \
         actor_rollout_ref.rollout.free_cache_engine=False \
         actor_rollout_ref.rollout.n=8 \
         actor_rollout_ref.rollout.load_format="safetensors" \
         actor_rollout_ref.rollout.layered_summon=True \
-        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
         actor_rollout_ref.ref.fsdp_config.param_offload=False \
         algorithm.use_kl_in_reward=False \
         trainer.critic_warmup=0 \

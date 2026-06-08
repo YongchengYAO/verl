@@ -173,7 +173,7 @@ if [ "$DRY_RUN" != "1" ]; then
         trainer.validation_data_dir=$validation_data_dir \
         custom_reward_function.path=$reward_function_path \
         custom_reward_function.name=$reward_function_name \
-        reward_model.use_reward_loop=True \
+        +reward_model.use_reward_loop=True \
         data.custom_cls.path=$custom_cls_path \
         data.custom_cls.name=$custom_cls_name \
         $@

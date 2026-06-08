@@ -150,3 +150,6 @@ CLAUDE.md
 dev
 .dev
 dev-*
+
+# graphify tooling output
+graphify-out/
