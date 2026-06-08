@@ -8,8 +8,8 @@
 #
 # Env vars:
 #   ENV_NAME           conda env name (default: verl)
-#   RUN_SYSTEM_FIXES   set to 1 (with sudo available) to apply the host GLIBC fix for
-#                      flash-attn's `GLIBC_2.32' not found error (default: off)
+#   RUN_SYSTEM_FIXES   set to 0 to skip the host GLIBC fix for flash-attn's
+#                      `GLIBC_2.32' not found error (default: on; needs sudo)
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,12 +49,12 @@ fi
 
 # 5. (Optional) Host-level GLIBC fix for flash-attn `GLIBC_2.32' not found -- needs root.
 #    Reference: https://github.com/modular/modular/issues/3684#issuecomment-2480409734
-if [ "${RUN_SYSTEM_FIXES:-0}" = "1" ] && command -v sudo >/dev/null 2>&1; then
+if [ "${RUN_SYSTEM_FIXES:-1}" = "1" ] && command -v sudo >/dev/null 2>&1; then
     echo "deb http://th.archive.ubuntu.com/ubuntu jammy main" | sudo tee -a /etc/apt/sources.list
     sudo apt-get update -y
     sudo apt-get install -y libc6 zlib1g-dev libtinfo-dev
 else
-    echo "Skipping system GLIBC fix (set RUN_SYSTEM_FIXES=1 with sudo if flash-attn reports GLIBC_2.32)."
+    echo "Skipping system GLIBC fix (RUN_SYSTEM_FIXES=0 or sudo not available)."
 fi
 
 echo "Environment '${ENV_NAME}' is ready."

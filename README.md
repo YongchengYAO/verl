@@ -33,17 +33,6 @@ no process reward).
 
 ---
 
-## Commit summary (this branch, on top of upstream `origin/main`)
-
-| Commit | Summary |
-|--------|---------|
-| `feat: MedVision RFT support` | Adds the dataset class, reward functions, GRPO recipes, and conda/env setup. Patches a handful of upstream files (reward routing, reward logging, model-merge dtype, LoRA save). |
-| `feat: add normalized L2 process rewards (v2/v3)` | Two process-reward variants for A/D and T/L: **v2 = mean** normalized-L2 over localization steps, **v3 = max** normalized-L2. |
-| `fix: adapt MedVisionDataset to upstream async AgentLoop` | Upstream moved tokenization/image-processing into the async `AgentLoopWorker`. Replaces the old synchronous `__getitem__` with a `_build_messages` adapter; verified data-equivalent to the pre-rebase pipeline (byte-identical prompts, same images, same resize grid). |
-| `fix: Hydra use_reward_loop prefix + dataset fallback; add H100 recipes` | `+reward_model.use_reward_loop` (upstream dropped the key from the config struct); `shards/ → train_verl.parquet` dataset-path fallback; H100-tuned multiTask recipes. |
-
----
-
 ## New components
 
 ### Reward functions — `verl/utils/reward_score/medvision_rewards/`
@@ -70,9 +59,8 @@ environment variables (scripts fail fast with a helpful message if unset).
 
 - **Sequential single-task** (4×H200), run A/D → T/L → detection:
   `…__AD__…__H200.sh`, `…__AD-TL__…__H200.sh`, `…__AD-TL-D__…__H200.sh`
-- **Multi-task** (single mixed run): `…__multiTask__…__H200_v2.sh` / `_v3.sh` and H100 variants
-  `…__multiTask__…__H100_v2.sh` / `_v3.sh`. **v2 = mean**, **v3 = max** normalized-L2 process
-  reward; H100 variants use smaller micro-batches and lower `gpu_memory_utilization` for 80 GB.
+- **Multi-task** (single mixed run): `…__multiTask__…__H200_v2.sh` / `_v3.sh`. **v2 = mean**,
+  **v3 = max** normalized-L2 process reward.
 
 ### Environment — repo root
 - `setup_conda_verl.sh` — creates the conda `verl` env (Python 3.12) and installs the full pinned
