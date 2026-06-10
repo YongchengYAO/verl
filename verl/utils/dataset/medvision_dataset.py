@@ -68,6 +68,68 @@ class MedVisionDataset(RLHFDataset):
             processor=processor,
             max_samples=max_samples,
         )
+        # Curriculum sample filtering (data.curriculum.enable). The trainer calls
+        # init_curriculum() on the train dataset only, so the val dataset never
+        # carries a manager and the disabled path is unchanged.
+        self.curriculum_manager = None
+
+    def init_curriculum(self, curriculum_config, min_active_size: int):
+        """Creates the curriculum manager from per-row task labels (train dataset only)."""
+        from verl.utils.dataset.curriculum import CurriculumManager
+        from verl.utils.dataset.temperature_sampler import parse_task_group_map
+
+        task_key = curriculum_config.get("task_key", "ability")
+        if task_key not in self.dataframe.column_names:
+            raise ValueError(f"Curriculum requires a dataset column '{task_key}' for per-task pooling.")
+        group_map = parse_task_group_map(curriculum_config.get("task_group_map", None))
+        task_labels = [group_map.get(str(label), str(label)) for label in self.dataframe[task_key]]
+
+        self.curriculum_manager = CurriculumManager(
+            task_labels,
+            easy_top_frac=curriculum_config.get("easy_top_frac", 0.20),
+            mre_gate=curriculum_config.get("mre_gate", 0.10),
+            threshold_frac=curriculum_config.get("threshold_frac", 0.50),
+            mixin_easy_frac=curriculum_config.get("mixin_easy_frac", 0.30),
+            demote_easy=curriculum_config.get("demote_easy", True),
+            min_active_size=min_active_size,
+            ema_alpha=curriculum_config.get("ema_alpha", 0.4),
+            promote_patience=curriculum_config.get("promote_patience", 2),
+            demote_patience=curriculum_config.get("demote_patience", 1),
+            demote_margin=curriculum_config.get("demote_margin", 1.5),
+            audit_frac=curriculum_config.get("audit_frac", 0.05),
+            mixin_ramp=curriculum_config.get("mixin_ramp", True),
+            task_floor_frac=curriculum_config.get("task_floor_frac", 0.10),
+        )
+        print(
+            f"[Info] Curriculum filtering enabled: {self.curriculum_manager.n_samples} samples, "
+            f"tasks {dict((t, len(idx)) for t, idx in self.curriculum_manager.task_indices.items())}"
+        )
+
+    def on_batch_end(self, batch):
+        """Tallies per-sample rewards/errors after each training step (called by the trainer)."""
+        if self.curriculum_manager is None:
+            return
+        non_tensor = batch.non_tensor_batch
+        if "answer_error" not in non_tensor:
+            raise RuntimeError(
+                "Curriculum filtering needs per-sample 'answer_error' in the batch, which is only "
+                "populated by the reward loop. Launch with +reward_model.use_reward_loop=True."
+            )
+        scores = batch.batch["token_level_scores"].sum(dim=-1).cpu().tolist()
+        self.curriculum_manager.record(non_tensor["index"], scores, non_tensor["answer_error"])
+
+    def advance_curriculum(self):
+        """Reclassifies pools at an epoch boundary; returns the next epoch's active indices."""
+        active = self.curriculum_manager.advance_epoch()
+        return active
+
+    def __getitem__(self, item):
+        row_dict = super().__getitem__(item)
+        if self.curriculum_manager is not None:
+            # Stable per-sample identity = post-filter row position; flows into
+            # non_tensor_batch["index"] and survives the n-rollout repeat.
+            row_dict["index"] = item
+        return row_dict
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts

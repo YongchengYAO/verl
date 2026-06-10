@@ -31,6 +31,14 @@ r = r_format + r_process * r_answer        # process/answer rewards = exp(-error
 `r_process` rewards accurate intermediate landmark localization (A/D and T/L only; detection has
 no process reward).
 
+**Curriculum sample filtering** (optional): epoch-level hard-example mining that drops reliably
+solved samples from training (per-task easy/hard pools, EMA + patience promotion evidence,
+a retention mix-in that ramps to 30/70 with the solved fraction, a per-task anti-extinction
+floor, and rotating easy-pool audits with hysteresis-guarded demotion) so
+rollout compute concentrates on samples that still carry GRPO gradient. See
+**[`CURRICULUM_FILTERING.md`](./CURRICULUM_FILTERING.md)** for the algorithm, configuration,
+default-threshold rationale, checkpoint/resume behavior, and limitations.
+
 ---
 
 ## New components
@@ -50,7 +58,9 @@ structured `list[dict]` content with the image in a separate `images` column; th
 `_build_messages` override normalizes this into the `<image>`-placeholder form the upstream async
 AgentLoop expects, so images are injected unchanged from the parquet. Images are **pre-sized
 during data prep** (the prompt embeds pixel-size info), so no extra resize is introduced. Also
-supports optional `max_samples` subsampling.
+supports optional `max_samples` subsampling, and hosts the curriculum-filtering hooks
+(`init_curriculum` / `on_batch_end` / `advance_curriculum`, see
+[`CURRICULUM_FILTERING.md`](./CURRICULUM_FILTERING.md)).
 
 ### Training recipes — `examples/grpo_trainer/`
 Qwen2.5-VL-7B full-RFT GRPO scripts. Paths are **not hardcoded** — `verl_dir`/`workspace_root`
@@ -61,6 +71,8 @@ environment variables (scripts fail fast with a helpful message if unset).
   `…__AD__…__H200.sh`, `…__AD-TL__…__H200.sh`, `…__AD-TL-D__…__H200.sh`
 - **Multi-task** (single mixed run): `…__multiTask__…__H200_v2.sh` / `_v3.sh`. **v2 = mean**,
   **v3 = max** normalized-L2 process reward.
+- **Multi-task + curriculum filtering**: `…__multiTask__…__curriculum__H200.sh` — v3 plus
+  epoch-level easy-sample filtering (see [`CURRICULUM_FILTERING.md`](./CURRICULUM_FILTERING.md)).
 
 ### Environment — repo root
 - `setup_conda_verl.sh` — creates the conda `verl` env (Python 3.12) and installs the full pinned
@@ -74,7 +86,8 @@ environment variables (scripts fail fast with a helpful message if unset).
 |------|--------|
 | `verl/workers/reward_manager/naive.py` | Inject top-level `ability` into `extra_info` so reward fns can route by task (copy, no mutation) |
 | `verl/experimental/reward_loop/reward_manager/naive.py` | Same `ability` injection on the async reward-loop path |
-| `verl/trainer/ppo/ray_trainer.py` | Log extra/auxiliary reward components |
+| `verl/trainer/ppo/ray_trainer.py` | Log extra/auxiliary reward components; curriculum epoch-boundary hooks (pool advance, dataloader rebuild, `curriculum.json` save/resume) |
+| `verl/utils/dataset/curriculum.py` | **New** — curriculum pools + active-subset sampler ([docs](./CURRICULUM_FILTERING.md)) |
 | `verl/model_merger/base_model_merger.py` | Patch merged `config.json` to `dtype=bfloat16` |
 | `verl/utils/fsdp_utils.py` | LoRA: `get_peft_model_state_dict(..., save_embedding_layers=False)` |
 | `verl/protocol.py` | Make `ray` import optional (lightweight debug environments) |

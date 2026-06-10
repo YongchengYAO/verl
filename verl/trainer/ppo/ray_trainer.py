@@ -399,6 +399,20 @@ class RayPPOTrainer:
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
+        # Curriculum sample filtering (enable via +data.curriculum.enable=True)
+        curriculum_config = self.config.data.get("curriculum", None)
+        self.use_curriculum = curriculum_config is not None and curriculum_config.get("enable", False)
+        if self.use_curriculum:
+            if not hasattr(self.train_dataset, "init_curriculum"):
+                raise ValueError(
+                    "data.curriculum.enable=True requires a dataset with curriculum support "
+                    "(e.g. MedVisionDataset), got " + type(self.train_dataset).__name__
+                )
+            self.train_dataset.init_curriculum(
+                curriculum_config,
+                min_active_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            )
+
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
@@ -408,14 +422,9 @@ class RayPPOTrainer:
 
         num_workers = self.config.data["dataloader_num_workers"]
 
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-        )
+        self._train_collate_fn = collate_fn
+        self._curriculum_epoch_start_step = 1  # global step that starts the current epoch
+        self.train_dataloader = self._build_train_dataloader(train_sampler)
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
@@ -455,6 +464,70 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _build_train_dataloader(self, sampler):
+        return StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=self.config.data["dataloader_num_workers"],
+            drop_last=True,
+            collate_fn=self._train_collate_fn,
+            sampler=sampler,
+        )
+
+    def _advance_curriculum(self, logger):
+        """Reclassifies sample pools at an epoch boundary and rebuilds the train dataloader."""
+        from verl.utils.dataset.curriculum import build_active_sampler
+
+        manager = self.train_dataset.curriculum_manager
+        active = self.train_dataset.advance_curriculum()
+        logger.log(data=manager.metrics(), step=self.global_steps)
+        if manager.epoch < self.config.trainer.total_epochs:
+            sampler = build_active_sampler(self.config.data, self.train_dataset, active, manager.epoch)
+            self.train_dataloader = self._build_train_dataloader(sampler)
+            print(
+                f"[Info] Curriculum epoch {manager.epoch}: active set {len(active)} samples, "
+                f"{len(self.train_dataloader)} steps"
+            )
+        self._curriculum_epoch_start_step = self.global_steps
+
+    def _resume_curriculum(self, global_step_folder):
+        """Restores curriculum pools + dataloader on resume. Returns whether the saved
+        step was the last one of its epoch (so the dataloader state must not be restored)."""
+        from verl.utils.dataset.curriculum import build_active_sampler
+
+        manager = self.train_dataset.curriculum_manager
+        curriculum_path = os.path.join(global_step_folder, "curriculum.json")
+        if not os.path.exists(curriculum_path):
+            print(f"Warning: No curriculum state at {curriculum_path}; curriculum restarts from the full dataset")
+            steps_per_epoch = len(self.train_dataloader)
+            self._curriculum_epoch_start_step = self.global_steps - (self.global_steps % steps_per_epoch) + 1
+            # The checkpoint predates the curriculum, so its epochs all used the full
+            # dataset; fast-forward the manager so completed epochs are not re-run.
+            manager.epoch = self.global_steps // steps_per_epoch
+            return steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+
+        with open(curriculum_path) as f:
+            state = json.load(f)
+        self._curriculum_epoch_start_step = int(state.pop("epoch_start_step"))
+        manager.load_state_dict(state)
+        if manager.epoch > 0:
+            sampler = build_active_sampler(
+                self.config.data, self.train_dataset, manager.active_indices, manager.epoch
+            )
+            self.train_dataloader = self._build_train_dataloader(sampler)
+
+        steps_into_epoch = self.global_steps - self._curriculum_epoch_start_step + 1
+        at_epoch_boundary = steps_into_epoch >= len(self.train_dataloader)
+        if at_epoch_boundary:
+            # The saved epoch finished training but its pool update never ran (the
+            # process stopped before the epoch-end advance). Run it now from the
+            # restored tally and start the next epoch from scratch.
+            active = self.train_dataset.advance_curriculum()
+            sampler = build_active_sampler(self.config.data, self.train_dataset, active, manager.epoch)
+            self.train_dataloader = self._build_train_dataloader(sampler)
+            self._curriculum_epoch_start_step = self.global_steps + 1
+        return at_epoch_boundary
 
     @staticmethod
     def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
@@ -1027,6 +1100,13 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # save curriculum pools + mid-epoch tally (needed to resume with shrunken epochs)
+        if getattr(self, "use_curriculum", False):
+            curriculum_state = self.train_dataset.curriculum_manager.state_dict()
+            curriculum_state["epoch_start_step"] = self._curriculum_epoch_start_step
+            with open(os.path.join(local_global_step_folder, "curriculum.json"), "w") as f:
+                json.dump(curriculum_state, f)
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1095,8 +1175,15 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            steps_per_epoch = len(self.train_dataloader)
-            at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+            if getattr(self, "use_curriculum", False):
+                # Epoch lengths vary under the curriculum: restore pools first (possibly
+                # rebuilding the dataloader for the saved epoch's active set), and let the
+                # curriculum state decide whether the saved step closed its epoch.
+                at_epoch_boundary = self._resume_curriculum(global_step_folder)
+                steps_per_epoch = len(self.train_dataloader)
+            else:
+                steps_per_epoch = len(self.train_dataloader)
+                at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
             if at_epoch_boundary:
                 print(
                     f"Skipping dataloader state restore: global_steps={self.global_steps} "
@@ -1389,7 +1476,11 @@ class RayPPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        if self.use_curriculum:
+            # epoch lengths vary; the curriculum manager tracks the epoch in progress
+            current_epoch = self.train_dataset.curriculum_manager.epoch
+        else:
+            current_epoch = self.global_steps // len(self.train_dataloader)
 
         SkipManager.init(self.config)
 
@@ -1777,6 +1868,20 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            if self.use_curriculum:
+                self._advance_curriculum(logger)
+
+        if self.use_curriculum:
+            # With shrinking epochs global_steps never reaches the precomputed
+            # total_training_steps, so the is_last_step finalization above never
+            # runs; save the final checkpoint here instead.
+            if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+            self.global_steps -= 1  # point back at the last completed step
+            if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq != 0:
+                self._save_checkpoint()
+            progress_bar.close()
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
