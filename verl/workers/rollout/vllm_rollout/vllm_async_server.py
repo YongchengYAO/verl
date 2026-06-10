@@ -504,6 +504,15 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        if (image_data is not None or video_data is not None) and self.model_config.processor is None:
+            # A None processor (e.g. transient hub failure in hf_processor) would silently skip
+            # image-token dedup below, corrupting the prompt and crashing the engine with a
+            # CUDA device-side assert (masked_scatter: totalElements <= srcSize). Fail loudly here.
+            raise RuntimeError(
+                "Multimodal request received but the HF processor failed to load (processor is None). "
+                "Check the 'Failed to create processor' warning at startup; if the model is a hub id, "
+                "download it to a local directory and use that path instead."
+            )
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
