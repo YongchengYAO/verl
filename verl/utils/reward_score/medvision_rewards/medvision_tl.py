@@ -17,11 +17,13 @@ import re
 import numpy as np
 
 from verl.utils.reward_score.medvision_rewards.reward_fn import (
-    cal_MAE_reward,
-    cal_MRE_reward,
-    cal_norm_L2_max_reward,
-    cal_norm_L2_reward,
+    cal_MAE_error,
+    cal_MRE_error,
+    cal_norm_L2_error,
+    cal_norm_L2_max_error,
+    cal_reward_from_error_or_zero,
     extract_last_k_nums,
+    safe_nanmean,
 )
 
 
@@ -209,18 +211,21 @@ def _to_float(*gs):
     return tuple(float(x) for x in gs)
 
 
-def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+def cal_process_reward_error(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Calculates the process reward.
+    Calculates the process reward together with the raw process errors.
 
     The process reward evaluates the step-by-step reasoning and intermediate answers in the model's response (solution).
+    The reward for an unparseable step is 0; its error is NaN (excluded from the error means).
 
     Args:
         solution: model responses (text)
         ground_truth: ground truth string.
 
     Returns:
-        a scalar reward
+        A tuple (reward, localization_error, measurement_error) where
+        localization_error is the mean MAE over the landmark steps (1-2) and
+        measurement_error is the mean MRE over the length steps (3-4).
     """
 
     # Step patterns: reasoning + answer
@@ -254,6 +259,7 @@ def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", 
 
     pred_major_wh = None
     pred_minor_wh = None
+    err_s1 = err_s2 = err_s3 = err_s4 = float("nan")
 
     try:
         # NOTE: MAE reward should be used for normalized coordinates (step 1 and step 2)
@@ -270,20 +276,17 @@ def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", 
                 y2_major,
             ]
             # Calculate MAE for both orderings of points (P1, P2) vs (P2, P1)
-            reward_s1 = max(
-                cal_MAE_reward(
+            err_s1 = min(
+                cal_MAE_error(
                     pred_major_wh,
                     [gt_p1_wh[0], gt_p1_wh[1], gt_p2_wh[0], gt_p2_wh[1]],
-                    reward_mapping_func,
                 ),
-                cal_MAE_reward(
+                cal_MAE_error(
                     pred_major_wh,
                     [gt_p2_wh[0], gt_p2_wh[1], gt_p1_wh[0], gt_p1_wh[1]],
-                    reward_mapping_func,
                 ),
             )
-        else:
-            reward_s1 = 0
+        reward_s1 = cal_reward_from_error_or_zero(err_s1, reward_mapping_func)
 
         # --- parse step 2: Minor Axis Endpoints
         m2 = pattern_step2.search(solution)
@@ -296,67 +299,71 @@ def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", 
                 y2_minor,
             ]
             # Calculate MAE for both orderings of points (P3, P4) vs (P4, P3)
-            reward_s2 = max(
-                cal_MAE_reward(
+            err_s2 = min(
+                cal_MAE_error(
                     pred_minor_wh,
                     [gt_p3_wh[0], gt_p3_wh[1], gt_p4_wh[0], gt_p4_wh[1]],
-                    reward_mapping_func,
                 ),
-                cal_MAE_reward(
+                cal_MAE_error(
                     pred_minor_wh,
                     [gt_p4_wh[0], gt_p4_wh[1], gt_p3_wh[0], gt_p3_wh[1]],
-                    reward_mapping_func,
                 ),
             )
-        else:
-            reward_s2 = 0
+        reward_s2 = cal_reward_from_error_or_zero(err_s2, reward_mapping_func)
 
         # --- parse step 3: Major Axis Length
         m3 = pattern_step3.search(solution)
         if m3:
             major_axis_length = _to_float(m3.group(1))
-            reward_s3 = cal_MRE_reward(
+            err_s3 = cal_MRE_error(
                 [major_axis_length],
                 [gt_float[0]],
-                reward_mapping_func,
             )  # gt_float[0] is the GT major axis length
-        else:
-            reward_s3 = 0
+        reward_s3 = cal_reward_from_error_or_zero(err_s3, reward_mapping_func)
 
         # --- parse step 4: Minor Axis Length
         m4 = pattern_step4.search(solution)
         if m4:
             minor_axis_length = _to_float(m4.group(1))
-            reward_s4 = cal_MRE_reward(
+            err_s4 = cal_MRE_error(
                 [minor_axis_length],
                 [gt_float[1]],
-                reward_mapping_func,
             )  # gt_float[1] is the GT minor axis length
-        else:
-            reward_s4 = 0
+        reward_s4 = cal_reward_from_error_or_zero(err_s4, reward_mapping_func)
 
         reward = np.mean([reward_s1, reward_s2, reward_s3, reward_s4])
 
     except Exception as e:
         print(f"Exception in cal_process_reward: {e}")
         reward = 0.0
+        err_s1 = err_s2 = err_s3 = err_s4 = float("nan")
 
-    return reward
+    return reward, safe_nanmean([err_s1, err_s2]), safe_nanmean([err_s3, err_s4])
 
 
-def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+def cal_process_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Variant of cal_process_reward using normalized L2 distance for localization steps.
+    Calculates the process reward (see cal_process_reward_error).
 
-    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_reward instead of cal_MAE_reward.
-    Steps 3 & 4 (axis length estimation) are unchanged (cal_MRE_reward).
+    Returns:
+        a scalar reward
+    """
+    return cal_process_reward_error(solution, ground_truth, reward_mapping_func, **kwargs)[0]
+
+
+def cal_process_reward_error_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Variant of cal_process_reward_error using normalized L2 distance for localization steps.
+
+    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_error instead of cal_MAE_error.
+    Steps 3 & 4 (axis length estimation) are unchanged (cal_MRE_error).
 
     Args:
         solution: model responses (text)
         ground_truth: ground truth string.
 
     Returns:
-        a scalar reward
+        A tuple (reward, localization_error, measurement_error); see cal_process_reward_error.
     """
 
     # Step patterns: reasoning + answer
@@ -390,6 +397,7 @@ def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay
 
     pred_major_wh = None
     pred_minor_wh = None
+    err_s1 = err_s2 = err_s3 = err_s4 = float("nan")
 
     try:
         # NOTE: norm_L2 reward should be used for normalized coordinates (step 1 and step 2)
@@ -406,20 +414,17 @@ def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay
                 y2_major,
             ]
             # Calculate norm_L2 for both orderings of points (P1, P2) vs (P2, P1)
-            reward_s1 = max(
-                cal_norm_L2_reward(
+            err_s1 = min(
+                cal_norm_L2_error(
                     pred_major_wh,
                     [gt_p1_wh[0], gt_p1_wh[1], gt_p2_wh[0], gt_p2_wh[1]],
-                    reward_mapping_func,
                 ),
-                cal_norm_L2_reward(
+                cal_norm_L2_error(
                     pred_major_wh,
                     [gt_p2_wh[0], gt_p2_wh[1], gt_p1_wh[0], gt_p1_wh[1]],
-                    reward_mapping_func,
                 ),
             )
-        else:
-            reward_s1 = 0
+        reward_s1 = cal_reward_from_error_or_zero(err_s1, reward_mapping_func)
 
         # --- parse step 2: Minor Axis Endpoints
         m2 = pattern_step2.search(solution)
@@ -432,52 +437,56 @@ def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay
                 y2_minor,
             ]
             # Calculate norm_L2 for both orderings of points (P3, P4) vs (P4, P3)
-            reward_s2 = max(
-                cal_norm_L2_reward(
+            err_s2 = min(
+                cal_norm_L2_error(
                     pred_minor_wh,
                     [gt_p3_wh[0], gt_p3_wh[1], gt_p4_wh[0], gt_p4_wh[1]],
-                    reward_mapping_func,
                 ),
-                cal_norm_L2_reward(
+                cal_norm_L2_error(
                     pred_minor_wh,
                     [gt_p4_wh[0], gt_p4_wh[1], gt_p3_wh[0], gt_p3_wh[1]],
-                    reward_mapping_func,
                 ),
             )
-        else:
-            reward_s2 = 0
+        reward_s2 = cal_reward_from_error_or_zero(err_s2, reward_mapping_func)
 
         # --- parse step 3: Major Axis Length
         m3 = pattern_step3.search(solution)
         if m3:
             major_axis_length = _to_float(m3.group(1))
-            reward_s3 = cal_MRE_reward(
+            err_s3 = cal_MRE_error(
                 [major_axis_length],
                 [gt_float[0]],
-                reward_mapping_func,
             )  # gt_float[0] is the GT major axis length
-        else:
-            reward_s3 = 0
+        reward_s3 = cal_reward_from_error_or_zero(err_s3, reward_mapping_func)
 
         # --- parse step 4: Minor Axis Length
         m4 = pattern_step4.search(solution)
         if m4:
             minor_axis_length = _to_float(m4.group(1))
-            reward_s4 = cal_MRE_reward(
+            err_s4 = cal_MRE_error(
                 [minor_axis_length],
                 [gt_float[1]],
-                reward_mapping_func,
             )  # gt_float[1] is the GT minor axis length
-        else:
-            reward_s4 = 0
+        reward_s4 = cal_reward_from_error_or_zero(err_s4, reward_mapping_func)
 
         reward = np.mean([reward_s1, reward_s2, reward_s3, reward_s4])
 
     except Exception as e:
         print(f"Exception in cal_process_reward_v2: {e}")
         reward = 0.0
+        err_s1 = err_s2 = err_s3 = err_s4 = float("nan")
 
-    return reward
+    return reward, safe_nanmean([err_s1, err_s2]), safe_nanmean([err_s3, err_s4])
+
+
+def cal_process_reward_v2(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Calculates the v2 process reward (see cal_process_reward_error_v2).
+
+    Returns:
+        a scalar reward
+    """
+    return cal_process_reward_error_v2(solution, ground_truth, reward_mapping_func, **kwargs)[0]
 
 
 def cal_format_reward(solution, alpha=0.8):
@@ -498,9 +507,10 @@ def cal_format_reward(solution, alpha=0.8):
     return reward
 
 
-def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+def cal_answer_reward_error(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Calculates the MRE (Mean Relative Error) reward from the extracted final answer from the model response (solution).
+    Calculates the MRE (Mean Relative Error) reward and raw MRE from the extracted final answer
+    from the model response (solution).
 
     Args:
         solution: model responses (text)
@@ -508,7 +518,8 @@ def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", *
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        a scalar reward
+        A tuple (reward, answer_error) where answer_error is the MRE
+        (NaN if the answer is unparseable).
     """
 
     # Extract ground truth coordinates
@@ -546,17 +557,25 @@ def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", *
             ]
             pred_float = [float(part) for part in pred_parts if part]
             if len(pred_float) != num_gt:
-                return 0.0
+                return 0.0, float("nan")
         except Exception:
-            return 0.0
+            return 0.0, float("nan")
 
     # Compute MRE reward
-    if len(pred_float) != len(gt_float):
-        reward = 0.0
-    else:
-        reward = cal_MRE_reward(pred_float, gt_float, reward_mapping_func)
+    error = cal_MRE_error(pred_float, gt_float)
+    reward = cal_reward_from_error_or_zero(error, reward_mapping_func)
 
-    return reward
+    return reward, error
+
+
+def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Calculates the answer reward (see cal_answer_reward_error).
+
+    Returns:
+        a scalar reward
+    """
+    return cal_answer_reward_error(solution, ground_truth, reward_mapping_func, **kwargs)[0]
 
 
 def compute_score_exp_decay(
@@ -581,8 +600,12 @@ def compute_score_exp_decay(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = format_reward + process_reward + answer_reward
 
     return {
@@ -590,6 +613,9 @@ def compute_score_exp_decay(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }
 
 
@@ -615,8 +641,12 @@ def compute_score_exp_decay_PRxAnswer(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = format_reward + process_reward * answer_reward
 
     return {
@@ -624,23 +654,26 @@ def compute_score_exp_decay_PRxAnswer(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }
 
 
-def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+def cal_process_reward_error_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Variant of cal_process_reward using max normalized L2 distance for localization steps.
+    Variant of cal_process_reward_error using max normalized L2 distance for localization steps.
 
-    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_max_reward: the localization
+    Steps 1 & 2 (landmark coordinate prediction) use cal_norm_L2_max_error: the localization
     error per step is the worst-case (max) per-point normalized L2 distance instead of the mean.
-    Steps 3 & 4 (axis length estimation) are unchanged (cal_MRE_reward).
+    Steps 3 & 4 (axis length estimation) are unchanged (cal_MRE_error).
 
     Args:
         solution: model responses (text)
         ground_truth: ground truth string.
 
     Returns:
-        a scalar reward
+        A tuple (reward, localization_error, measurement_error); see cal_process_reward_error.
     """
 
     # Step patterns: reasoning + answer
@@ -674,6 +707,7 @@ def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay
 
     pred_major_wh = None
     pred_minor_wh = None
+    err_s1 = err_s2 = err_s3 = err_s4 = float("nan")
 
     try:
         # NOTE: norm_L2_max reward should be used for normalized coordinates (step 1 and step 2)
@@ -690,20 +724,17 @@ def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay
                 y2_major,
             ]
             # Calculate norm_L2_max for both orderings of points (P1, P2) vs (P2, P1)
-            reward_s1 = max(
-                cal_norm_L2_max_reward(
+            err_s1 = min(
+                cal_norm_L2_max_error(
                     pred_major_wh,
                     [gt_p1_wh[0], gt_p1_wh[1], gt_p2_wh[0], gt_p2_wh[1]],
-                    reward_mapping_func,
                 ),
-                cal_norm_L2_max_reward(
+                cal_norm_L2_max_error(
                     pred_major_wh,
                     [gt_p2_wh[0], gt_p2_wh[1], gt_p1_wh[0], gt_p1_wh[1]],
-                    reward_mapping_func,
                 ),
             )
-        else:
-            reward_s1 = 0
+        reward_s1 = cal_reward_from_error_or_zero(err_s1, reward_mapping_func)
 
         # --- parse step 2: Minor Axis Endpoints
         m2 = pattern_step2.search(solution)
@@ -716,52 +747,56 @@ def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay
                 y2_minor,
             ]
             # Calculate norm_L2_max for both orderings of points (P3, P4) vs (P4, P3)
-            reward_s2 = max(
-                cal_norm_L2_max_reward(
+            err_s2 = min(
+                cal_norm_L2_max_error(
                     pred_minor_wh,
                     [gt_p3_wh[0], gt_p3_wh[1], gt_p4_wh[0], gt_p4_wh[1]],
-                    reward_mapping_func,
                 ),
-                cal_norm_L2_max_reward(
+                cal_norm_L2_max_error(
                     pred_minor_wh,
                     [gt_p4_wh[0], gt_p4_wh[1], gt_p3_wh[0], gt_p3_wh[1]],
-                    reward_mapping_func,
                 ),
             )
-        else:
-            reward_s2 = 0
+        reward_s2 = cal_reward_from_error_or_zero(err_s2, reward_mapping_func)
 
         # --- parse step 3: Major Axis Length
         m3 = pattern_step3.search(solution)
         if m3:
             major_axis_length = _to_float(m3.group(1))
-            reward_s3 = cal_MRE_reward(
+            err_s3 = cal_MRE_error(
                 [major_axis_length],
                 [gt_float[0]],
-                reward_mapping_func,
             )  # gt_float[0] is the GT major axis length
-        else:
-            reward_s3 = 0
+        reward_s3 = cal_reward_from_error_or_zero(err_s3, reward_mapping_func)
 
         # --- parse step 4: Minor Axis Length
         m4 = pattern_step4.search(solution)
         if m4:
             minor_axis_length = _to_float(m4.group(1))
-            reward_s4 = cal_MRE_reward(
+            err_s4 = cal_MRE_error(
                 [minor_axis_length],
                 [gt_float[1]],
-                reward_mapping_func,
             )  # gt_float[1] is the GT minor axis length
-        else:
-            reward_s4 = 0
+        reward_s4 = cal_reward_from_error_or_zero(err_s4, reward_mapping_func)
 
         reward = np.mean([reward_s1, reward_s2, reward_s3, reward_s4])
 
     except Exception as e:
         print(f"Exception in cal_process_reward_v3: {e}")
         reward = 0.0
+        err_s1 = err_s2 = err_s3 = err_s4 = float("nan")
 
-    return reward
+    return reward, safe_nanmean([err_s1, err_s2]), safe_nanmean([err_s3, err_s4])
+
+
+def cal_process_reward_v3(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Calculates the v3 process reward (see cal_process_reward_error_v3).
+
+    Returns:
+        a scalar reward
+    """
+    return cal_process_reward_error_v3(solution, ground_truth, reward_mapping_func, **kwargs)[0]
 
 
 def compute_score_exp_decay_PRxAnswer_v2(
@@ -790,8 +825,12 @@ def compute_score_exp_decay_PRxAnswer_v2(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward_v2(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error_v2(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = format_reward + process_reward * answer_reward
 
     return {
@@ -799,6 +838,9 @@ def compute_score_exp_decay_PRxAnswer_v2(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }
 
 
@@ -828,8 +870,12 @@ def compute_score_exp_decay_PRxAnswer_v3(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward_v3(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error_v3(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = format_reward + process_reward * answer_reward
 
     return {
@@ -837,6 +883,9 @@ def compute_score_exp_decay_PRxAnswer_v3(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }
 
 
@@ -862,8 +911,12 @@ def compute_score_exp_decay_morePR(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = 0.1 * format_reward + process_reward + 0.1 * answer_reward
 
     return {
@@ -871,6 +924,9 @@ def compute_score_exp_decay_morePR(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }
 
 
@@ -896,13 +952,16 @@ def compute_score_exp_decay_wo_proc(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = format_reward + answer_reward
 
     return {
         "score": reward,
         "format_reward": format_reward,
         "answer_reward": answer_reward,
+        "answer_error": answer_error,
     }
 
 
@@ -928,8 +987,12 @@ def compute_score_scaled_sigmoid(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error(
+        solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info
+    )
     reward = format_reward + process_reward + answer_reward
 
     return {
@@ -937,6 +1000,9 @@ def compute_score_scaled_sigmoid(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }
 
 
@@ -962,8 +1028,12 @@ def compute_score_gaussian_proxy(
         extra_info = {}
 
     format_reward = cal_format_reward(solution_str)
-    process_reward = cal_process_reward(solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info)
+    process_reward, localization_error, measurement_error = cal_process_reward_error(
+        solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info
+    )
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info
+    )
     reward = format_reward + process_reward + answer_reward
 
     return {
@@ -971,4 +1041,7 @@ def compute_score_gaussian_proxy(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        "localization_error": localization_error,
+        "measurement_error": measurement_error,
+        "answer_error": answer_error,
     }

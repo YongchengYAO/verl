@@ -603,9 +603,11 @@ def process_validation_metrics(
         for var_name, var_vals in infos_dict.items():
             var2vals[var_name].append(var_vals[sample_idx])
 
-    np_mean = np.mean
-    np_std = np.std
-    reduce_fns_best_worst = [np.max, np.min]
+    # NaN-aware aggregation: reward fns may emit NaN for non-applicable metrics
+    # (e.g. medvision per-task error keys); NaN entries are excluded from the stats.
+    np_mean = np.nanmean
+    np_std = np.nanstd
+    reduce_fns_best_worst = [np.nanmax, np.nanmin]
     n_bootstrap = 1000
 
     # 2. cache ns list
@@ -698,5 +700,5 @@ def process_validation_metrics(
     for data_source, var2metric2uid_vals in data_src2var2metric2uid_vals.items():
         for var_name, metric2uid_vals in var2metric2uid_vals.items():
             for metric_name, uid_vals in metric2uid_vals.items():
-                data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
+                data_src2var2metric2val[data_source][var_name][metric_name] = np.nanmean(uid_vals)
     return data_src2var2metric2val

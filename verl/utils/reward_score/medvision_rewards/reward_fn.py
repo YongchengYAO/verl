@@ -113,6 +113,153 @@ def cal_reward_from_error(error, reward_mapping_func="exp_decay"):
     return 0.0
 
 
+def safe_nanmean(values):
+    """
+    Mean over the non-NaN entries of `values`; NaN if all entries are NaN (no RuntimeWarning).
+
+    Args:
+        values: Iterable of floats (may contain NaN).
+
+    Returns:
+        The mean of valid entries, or NaN if none.
+    """
+    valid = [v for v in values if not np.isnan(v)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
+def cal_reward_from_error_or_zero(error, reward_mapping_func="exp_decay"):
+    """
+    Maps an error to a reward; returns 0.0 if the error is NaN (e.g. parse/shape failure).
+
+    Args:
+        error: The calculated error (may be NaN).
+        reward_mapping_func: The name of the reward mapping function to use.
+
+    Returns:
+        The calculated reward.
+    """
+    if np.isnan(error):
+        return 0.0
+    return cal_reward_from_error(error, reward_mapping_func)
+
+
+def cal_MRE_error(pred_float, gt_float):
+    """
+    Calculates the Mean Relative Error (MRE).
+
+    Args:
+        pred_float: Predicted values.
+        gt_float: Ground truth values.
+
+    Returns:
+        The MRE, or NaN on length mismatch.
+    """
+    # Convert inputs to numpy arrays if they aren't already
+    try:
+        if not isinstance(pred_float, np.ndarray):
+            pred_float = np.array(pred_float)
+        if not isinstance(gt_float, np.ndarray):
+            gt_float = np.array(gt_float)
+    except Exception as e:
+        raise ValueError(f"Error converting model answer and GT to numpy array: {str(e)}") from e
+
+    if len(pred_float) != len(gt_float):
+        return float("nan")
+    return np.mean(np.abs(pred_float - gt_float) / (gt_float + 1e-15))
+
+
+def cal_MAE_error(pred_float, gt_float):
+    """
+    Calculates the Mean Absolute Error (MAE).
+
+    Args:
+        pred_float: Predicted values.
+        gt_float: Ground truth values.
+
+    Returns:
+        The MAE, or NaN on length mismatch.
+    """
+    # Convert inputs to numpy arrays if they aren't already
+    try:
+        if not isinstance(pred_float, np.ndarray):
+            pred_float = np.array(pred_float)
+        if not isinstance(gt_float, np.ndarray):
+            gt_float = np.array(gt_float)
+    except Exception as e:
+        raise ValueError(f"Error converting model answer and GT to numpy array: {str(e)}") from e
+
+    if len(pred_float) != len(gt_float):
+        return float("nan")
+    return np.mean(np.abs(pred_float - gt_float))
+
+
+def _cal_norm_L2_dists(pred_xy_flat, gt_xy_flat):
+    """
+    Per-point normalized L2 distances for flat coordinate lists, or None on shape mismatch.
+    """
+    try:
+        pred = np.array(pred_xy_flat, dtype=float)
+        gt = np.array(gt_xy_flat, dtype=float)
+    except Exception as e:
+        raise ValueError(f"Error converting inputs to numpy array: {str(e)}") from e
+
+    if len(pred) != len(gt) or len(pred) % 2 != 0 or len(pred) == 0:
+        return None
+
+    n_points = len(pred) // 2
+    dists = []
+    for i in range(n_points):
+        dx = pred[2 * i] - gt[2 * i]
+        dy = pred[2 * i + 1] - gt[2 * i + 1]
+        dists.append(np.sqrt(dx**2 + dy**2) / np.sqrt(2))
+    return dists
+
+
+def cal_norm_L2_error(pred_xy_flat, gt_xy_flat):
+    """
+    Mean normalized L2 distance for 2D point(s).
+
+    Inputs are flat coordinate lists in normalized [0, 1] image space:
+      - single point:  [x, y]
+      - two endpoints: [x1, y1, x2, y2]
+
+    For each (x, y) pair: dist = sqrt(dx^2 + dy^2) / sqrt(2).
+    Error = mean over all point pairs. Range: [0, 1].
+
+    Args:
+        pred_xy_flat: Predicted flat coordinate list.
+        gt_xy_flat: Ground truth flat coordinate list.
+
+    Returns:
+        The error, or NaN on shape mismatch.
+    """
+    dists = _cal_norm_L2_dists(pred_xy_flat, gt_xy_flat)
+    if dists is None:
+        return float("nan")
+    return float(np.mean(dists))
+
+
+def cal_norm_L2_max_error(pred_xy_flat, gt_xy_flat):
+    """
+    Max normalized L2 distance across 2D point(s).
+
+    Same as cal_norm_L2_error but aggregates per-point distances with max instead of mean.
+    For a single point the two functions are equivalent; for two endpoints this is stricter —
+    the error is determined by the worst-localized endpoint.
+
+    Args:
+        pred_xy_flat: Predicted flat coordinate list.
+        gt_xy_flat: Ground truth flat coordinate list.
+
+    Returns:
+        The error, or NaN on shape mismatch.
+    """
+    dists = _cal_norm_L2_dists(pred_xy_flat, gt_xy_flat)
+    if dists is None:
+        return float("nan")
+    return float(np.max(dists))
+
+
 def cal_MRE_reward(
     pred_float,
     gt_float,
@@ -127,23 +274,9 @@ def cal_MRE_reward(
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        A tuple containing (reward, mre).
+        The calculated reward (0.0 on length mismatch).
     """
-    # Convert inputs to numpy arrays if they aren't already
-    try:
-        if not isinstance(pred_float, np.ndarray):
-            pred_float = np.array(pred_float)
-        if not isinstance(gt_float, np.ndarray):
-            gt_float = np.array(gt_float)
-    except Exception as e:
-        raise ValueError(f"Error converting model answer and GT to numpy array: {str(e)}") from e
-
-    if len(pred_float) != len(gt_float):
-        return 0.0
-    else:
-        mre = np.mean(np.abs(pred_float - gt_float) / (gt_float + 1e-15))
-        reward = cal_reward_from_error(mre, reward_mapping_func)
-        return reward
+    return cal_reward_from_error_or_zero(cal_MRE_error(pred_float, gt_float), reward_mapping_func)
 
 
 def cal_MAE_reward(
@@ -160,23 +293,9 @@ def cal_MAE_reward(
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        The calculated reward.
+        The calculated reward (0.0 on length mismatch).
     """
-    # Convert inputs to numpy arrays if they aren't already
-    try:
-        if not isinstance(pred_float, np.ndarray):
-            pred_float = np.array(pred_float)
-        if not isinstance(gt_float, np.ndarray):
-            gt_float = np.array(gt_float)
-    except Exception as e:
-        raise ValueError(f"Error converting model answer and GT to numpy array: {str(e)}") from e
-
-    if len(pred_float) != len(gt_float):
-        return 0.0
-    else:
-        mae = np.mean(np.abs(pred_float - gt_float))
-        reward = cal_reward_from_error(mae, reward_mapping_func)
-        return reward
+    return cal_reward_from_error_or_zero(cal_MAE_error(pred_float, gt_float), reward_mapping_func)
 
 
 def cal_norm_L2_reward(
@@ -187,12 +306,7 @@ def cal_norm_L2_reward(
     """
     Reward based on mean normalized L2 distance for 2D point(s).
 
-    Inputs are flat coordinate lists in normalized [0, 1] image space:
-      - single point:  [x, y]
-      - two endpoints: [x1, y1, x2, y2]
-
-    For each (x, y) pair: dist = sqrt(dx^2 + dy^2) / sqrt(2).
-    Error = mean over all point pairs. Range: [0, 1].
+    See cal_norm_L2_error for the error definition.
 
     Args:
         pred_xy_flat: Predicted flat coordinate list.
@@ -200,25 +314,9 @@ def cal_norm_L2_reward(
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        The calculated reward.
+        The calculated reward (0.0 on shape mismatch).
     """
-    try:
-        pred = np.array(pred_xy_flat, dtype=float)
-        gt = np.array(gt_xy_flat, dtype=float)
-    except Exception as e:
-        raise ValueError(f"Error converting inputs to numpy array: {str(e)}") from e
-
-    if len(pred) != len(gt) or len(pred) % 2 != 0 or len(pred) == 0:
-        return 0.0
-
-    n_points = len(pred) // 2
-    dists = []
-    for i in range(n_points):
-        dx = pred[2 * i] - gt[2 * i]
-        dy = pred[2 * i + 1] - gt[2 * i + 1]
-        dists.append(np.sqrt(dx**2 + dy**2) / np.sqrt(2))
-    error = float(np.mean(dists))
-    return cal_reward_from_error(error, reward_mapping_func)
+    return cal_reward_from_error_or_zero(cal_norm_L2_error(pred_xy_flat, gt_xy_flat), reward_mapping_func)
 
 
 def cal_norm_L2_max_reward(
@@ -229,16 +327,7 @@ def cal_norm_L2_max_reward(
     """
     Reward based on max normalized L2 distance across 2D point(s).
 
-    Same as cal_norm_L2_reward but aggregates per-point distances with max instead of mean.
-    For a single point the two functions are equivalent; for two endpoints this is stricter —
-    the reward is determined by the worst-localized endpoint.
-
-    Inputs are flat coordinate lists in normalized [0, 1] image space:
-      - single point:  [x, y]
-      - two endpoints: [x1, y1, x2, y2]
-
-    For each (x, y) pair: dist = sqrt(dx^2 + dy^2) / sqrt(2).
-    Error = max over all point pairs. Range: [0, 1].
+    See cal_norm_L2_max_error for the error definition.
 
     Args:
         pred_xy_flat: Predicted flat coordinate list.
@@ -246,22 +335,6 @@ def cal_norm_L2_max_reward(
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        The calculated reward.
+        The calculated reward (0.0 on shape mismatch).
     """
-    try:
-        pred = np.array(pred_xy_flat, dtype=float)
-        gt = np.array(gt_xy_flat, dtype=float)
-    except Exception as e:
-        raise ValueError(f"Error converting inputs to numpy array: {str(e)}") from e
-
-    if len(pred) != len(gt) or len(pred) % 2 != 0 or len(pred) == 0:
-        return 0.0
-
-    n_points = len(pred) // 2
-    dists = []
-    for i in range(n_points):
-        dx = pred[2 * i] - gt[2 * i]
-        dy = pred[2 * i + 1] - gt[2 * i + 1]
-        dists.append(np.sqrt(dx**2 + dy**2) / np.sqrt(2))
-    error = float(np.max(dists))
-    return cal_reward_from_error(error, reward_mapping_func)
+    return cal_reward_from_error_or_zero(cal_norm_L2_max_error(pred_xy_flat, gt_xy_flat), reward_mapping_func)

@@ -15,17 +15,56 @@
 import re
 
 from verl.utils.reward_score.medvision_rewards.reward_fn import (
-    cal_MRE_reward,
+    cal_MRE_error,
+    cal_reward_from_error_or_zero,
     extract_last_k_nums,
 )
 from verl.utils.reward_score.medvision_rewards.medvision_tl import (
-    cal_process_reward_v2 as cal_tl_process_reward_v2,
-    cal_process_reward_v3 as cal_tl_process_reward_v3,
+    cal_process_reward_error_v2 as cal_tl_process_reward_error_v2,
+    cal_process_reward_error_v3 as cal_tl_process_reward_error_v3,
 )
 from verl.utils.reward_score.medvision_rewards.medvision_ad import (
-    cal_process_reward_v2 as cal_ad_process_reward_v2,
-    cal_process_reward_v3 as cal_ad_process_reward_v3,
+    cal_process_reward_error_v2 as cal_ad_process_reward_error_v2,
+    cal_process_reward_error_v3 as cal_ad_process_reward_error_v3,
 )
+
+# All supported abilities; all except detection have process (CoT step) rewards
+ABILITIES = ["medvision-tl", "medvision-angle", "medvision-distance", "medvision-detection"]
+
+
+def build_error_info(answer_error, localization_error=None, measurement_error=None):
+    """
+    Builds the error-logging dict with a FIXED key set regardless of ability.
+
+    A fixed key set is required because the reward loop takes the key list from the
+    first sample of a batch and indexes every sample with it
+    (see verl/experimental/reward_loop/reward_loop.py).
+
+    Keys:
+      - answer_error: MRE of the final answer, shared across all tasks
+      - if process errors are given: localization_error / measurement_error,
+        shared across AD and TL (normalized L2 and MRE definitions are consistent
+        across these tasks); NaN for detection, whose localization is already
+        captured by its answer error
+
+    NaN values are excluded by the np.nanmean aggregation during multi-task training.
+
+    Args:
+        answer_error: MRE of the final answer (NaN if unparseable).
+        localization_error: Localization error of the CoT steps (None to omit process keys).
+        measurement_error: Measurement error of the CoT steps (None to omit process keys).
+
+    Returns:
+        A dict of error metrics.
+    """
+    nan = float("nan")
+    info = {"answer_error": answer_error}
+
+    if localization_error is not None or measurement_error is not None:
+        info["localization_error"] = nan if localization_error is None else localization_error
+        info["measurement_error"] = nan if measurement_error is None else measurement_error
+
+    return info
 
 
 # Tag helpers: strict tags (no spaces inside <>), flexible spaces between structures
@@ -92,11 +131,7 @@ def cal_format_reward(solution, **kwargs):
     """
     # Validate ability and determine number of target values based on ability
     ability = kwargs.get("ability")
-    assert ability in ["medvision-tl", "medvision-angle", "medvision-distance", "medvision-detection"], (
-        "[Error] ability should be one of "
-        "['medvision-tl', 'medvision-angle', 'medvision-distance', 'medvision-detection'], "
-        f"but got {ability}."
-    )
+    assert ability in ABILITIES, f"[Error] ability should be one of {ABILITIES}, but got {ability}."
     if ability in ["medvision-tl"]:
         num_target_values = 2
     elif ability in ["medvision-angle", "medvision-distance"]:
@@ -110,9 +145,10 @@ def cal_format_reward(solution, **kwargs):
     return answer_format_reward
 
 
-def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+def cal_answer_reward_error(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Calculates the MRE (Mean Relative Error) reward from the extracted final answer from the model response (solution).
+    Calculates the MRE (Mean Relative Error) reward and raw MRE from the extracted final answer
+    from the model response (solution).
 
     Args:
         solution: model responses (text)
@@ -120,15 +156,12 @@ def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", *
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        a scalar reward
+        A tuple (reward, answer_error) where answer_error is the MRE
+        (NaN if the answer is unparseable).
     """
     # Validate ability and determine number of target values based on ability
     ability = kwargs.get("ability")
-    assert ability in ["medvision-tl", "medvision-angle", "medvision-distance", "medvision-detection"], (
-        "[Error] ability should be one of "
-        "['medvision-tl', 'medvision-angle', 'medvision-distance', 'medvision-detection'], "
-        f"but got {ability}."
-    )
+    assert ability in ABILITIES, f"[Error] ability should be one of {ABILITIES}, but got {ability}."
     if ability in ["medvision-tl"]:
         num_target_values = 2
     elif ability in ["medvision-angle", "medvision-distance"]:
@@ -179,17 +212,25 @@ def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", *
             ]
             pred_float = [float(part) for part in pred_parts if part]
             if len(pred_float) != num_gt:
-                return 0.0
+                return 0.0, float("nan")
         except Exception:
-            return 0.0
+            return 0.0, float("nan")
 
     # Compute MRE reward
-    if len(pred_float) != len(gt_float):
-        reward = 0.0
-    else:
-        reward = cal_MRE_reward(pred_float, gt_float, reward_mapping_func)
+    error = cal_MRE_error(pred_float, gt_float)
+    reward = cal_reward_from_error_or_zero(error, reward_mapping_func)
 
-    return reward
+    return reward, error
+
+
+def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """
+    Calculates the answer reward (see cal_answer_reward_error).
+
+    Returns:
+        a scalar reward
+    """
+    return cal_answer_reward_error(solution, ground_truth, reward_mapping_func, **kwargs)[0]
 
 
 def compute_score_exp_decay(
@@ -216,13 +257,16 @@ def compute_score_exp_decay(
     )
 
     format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
     reward = format_reward + answer_reward
 
     return {
         "score": reward,
         "format_reward": format_reward,
         "answer_reward": answer_reward,
+        **build_error_info(answer_error),
     }
 
 
@@ -250,13 +294,16 @@ def compute_score_scaled_sigmoid(
     )
 
     format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info)
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info
+    )
     reward = format_reward + answer_reward
 
     return {
         "score": reward,
         "format_reward": format_reward,
         "answer_reward": answer_reward,
+        **build_error_info(answer_error),
     }
 
 
@@ -284,13 +331,16 @@ def compute_score_gaussian_proxy(
     )
 
     format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info)
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info
+    )
     reward = format_reward + answer_reward
 
     return {
         "score": reward,
         "format_reward": format_reward,
         "answer_reward": answer_reward,
+        **build_error_info(answer_error),
     }
 
 
@@ -324,21 +374,24 @@ def compute_score_exp_decay_PRxAnswer_v2(
 
     ability = extra_info.get("ability")
     format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
 
     if ability == "medvision-tl":
-        process_reward = cal_tl_process_reward_v2(
+        process_reward, localization_error, measurement_error = cal_tl_process_reward_error_v2(
             solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
         )
         score = format_reward + process_reward * answer_reward
     elif ability in ["medvision-angle", "medvision-distance"]:
-        process_reward = cal_ad_process_reward_v2(
+        process_reward, localization_error, measurement_error = cal_ad_process_reward_error_v2(
             solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
         )
         score = format_reward + process_reward * answer_reward
     else:
         # medvision-detection: no process reward
         process_reward = 0.0
+        localization_error = measurement_error = float("nan")
         score = format_reward + answer_reward
 
     return {
@@ -346,6 +399,7 @@ def compute_score_exp_decay_PRxAnswer_v2(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        **build_error_info(answer_error, localization_error, measurement_error),
     }
 
 
@@ -379,21 +433,24 @@ def compute_score_exp_decay_PRxAnswer_v3(
 
     ability = extra_info.get("ability")
     format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward = cal_answer_reward(solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info)
+    answer_reward, answer_error = cal_answer_reward_error(
+        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    )
 
     if ability == "medvision-tl":
-        process_reward = cal_tl_process_reward_v3(
+        process_reward, localization_error, measurement_error = cal_tl_process_reward_error_v3(
             solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
         )
         score = format_reward + process_reward * answer_reward
     elif ability in ["medvision-angle", "medvision-distance"]:
-        process_reward = cal_ad_process_reward_v3(
+        process_reward, localization_error, measurement_error = cal_ad_process_reward_error_v3(
             solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
         )
         score = format_reward + process_reward * answer_reward
     else:
         # medvision-detection: no process reward
         process_reward = 0.0
+        localization_error = measurement_error = float("nan")
         score = format_reward + answer_reward
 
     return {
@@ -401,4 +458,5 @@ def compute_score_exp_decay_PRxAnswer_v3(
         "format_reward": format_reward,
         "process_reward": process_reward,
         "answer_reward": answer_reward,
+        **build_error_info(answer_error, localization_error, measurement_error),
     }

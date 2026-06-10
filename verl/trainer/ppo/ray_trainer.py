@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
@@ -1620,7 +1621,11 @@ class RayPPOTrainer:
                         for key in reward_extra_infos_dict:
                             if key != "score":
                                 this_val = np.array(reward_extra_infos_dict[key])
-                                metrics.update({f"critic/rewards/{key}": np.mean(this_val)})
+                                # nanmean: reward fns may emit NaN for non-applicable metrics
+                                # (e.g. medvision per-task error keys in multi-task batches)
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                                    metrics.update({f"critic/rewards/{key}": np.nanmean(this_val)})
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
