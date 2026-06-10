@@ -361,6 +361,15 @@ def create_rl_sampler(data_config, dataset):
     # torch.utils.data.RandomSampler could not recover properly
     from torchdata.stateful_dataloader.sampler import RandomSampler
 
+    # Temperature-based multitask rebalancing (enable via +data.temperature_sampler.enable=True)
+    temperature_sampler_config = data_config.get("temperature_sampler", None)
+    if temperature_sampler_config is not None and temperature_sampler_config.get("enable", False):
+        from verl.utils.dataset.temperature_sampler import create_temperature_sampler
+
+        sampler = create_temperature_sampler(data_config, dataset)
+        if sampler is not None:
+            return sampler
+
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.
     if data_config.shuffle:
