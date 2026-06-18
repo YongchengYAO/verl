@@ -35,7 +35,11 @@ no process reward).
 solved samples from training (per-task easy/hard pools, EMA + patience promotion evidence,
 a retention mix-in that ramps to 30/70 with the solved fraction, a per-task anti-extinction
 floor, and rotating easy-pool audits with hysteresis-guarded demotion) so
-rollout compute concentrates on samples that still carry GRPO gradient. See
+rollout compute concentrates on samples that still carry GRPO gradient. Full pool
+membership is dumped per epoch to `{default_local_dir}/curriculum_pools/epoch_NNNN.json`;
+sample `idx` there is the post-filter dataset row position — unique and resume-stable
+within a run, but positional (not a MedVision case ID): map back to cases by indexing
+the same train parquet(s) in the same order. See
 **[`CURRICULUM_FILTERING.md`](./CURRICULUM_FILTERING.md)** for the algorithm, configuration,
 default-threshold rationale, checkpoint/resume behavior, and limitations.
 

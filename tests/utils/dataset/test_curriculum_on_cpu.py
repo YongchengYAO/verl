@@ -206,15 +206,11 @@ class TestMixinPhase:
         assert mgr.metrics()["curriculum/TL/easy_pool"] == 5
 
     def test_demotion_enabled_by_default(self):
-        # Bare constructor: demote_easy=True, promote_patience=2, demote_patience=1,
+        # Bare constructor: demote_easy=True, promote_patience=1, demote_patience=1,
         # demote_margin=1.5, ema_alpha=0.4 are the defaults.
         mgr = CurriculumManager(["TL"] * 10, easy_top_frac=0.50)
-        # promote_patience=2: two consecutive passing epochs before promotion
         record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
-        mgr.advance_epoch()
-        assert mgr.metrics()["curriculum/TL/promoted"] == 0
-        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
-        mgr.advance_epoch()  # easy={5..9}, mixed in: {5, 6}
+        mgr.advance_epoch()  # promote_patience=1 -> easy={5..9}, mixed in: {5, 6}
         assert mgr.metrics()["curriculum/TL/promoted"] == 5
         # regression far past the hysteresis band (ema_mre = 0.4*0.9 + 0.6*0.05 = 0.39 >= 0.15)
         record_each(mgr, [6], [9.0], [0.9])
@@ -224,10 +220,10 @@ class TestMixinPhase:
 
 class TestConstructorDefaults:
     def test_default_easy_top_frac_is_twenty_percent(self):
-        mgr = CurriculumManager(["TL"] * 10)  # bare defaults: easy_top_frac=0.2, patience=2
-        for _ in range(2):
-            record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
-            mgr.advance_epoch()
+        # bare defaults: easy_top_frac=0.2, promote_patience=1 -> promotes on epoch 1
+        mgr = CurriculumManager(["TL"] * 10)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        mgr.advance_epoch()
         assert mgr.metrics()["curriculum/TL/promoted"] == 2  # floor(0.2 * 10)
 
     def test_default_ramp_and_task_floor(self):
@@ -485,6 +481,149 @@ class TestMetrics:
         assert m["curriculum/TL/promoted"] == 2
         assert m["curriculum/TL/active"] == 18
         assert m["curriculum/active_total"] == 18
+
+
+class TestPoolSnapshot:
+    DETAIL_KEYS = ("promoted", "demoted", "mixin", "audit", "floor_topup")
+
+    def test_snapshot_initial_state(self):
+        import json
+
+        mgr = make_manager(["TL"] * 10 + ["AD"] * 5)
+        snap = json.loads(json.dumps(mgr.pool_snapshot()))  # must be JSON-native
+        assert snap["epoch"] == 0
+        assert set(snap["tasks"]) == {"TL", "AD"}
+        assert snap["tasks"]["TL"]["hard"] == list(range(10))
+        assert snap["tasks"]["AD"]["hard"] == list(range(10, 15))
+        assert snap["tasks"]["TL"]["active"] == list(range(10))
+        for task in ("TL", "AD"):
+            assert snap["tasks"][task]["easy"] == []
+            for key in self.DETAIL_KEYS:
+                assert snap["tasks"][task][key] == []
+        assert snap["floor_topup_global"] == []
+        assert snap["stats"] == {}
+
+    def test_snapshot_after_promotion(self):
+        mgr = make_manager(["TL"] * 10, easy_top_frac=0.50)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        active = mgr.advance_epoch()  # easy={5..9}, mixin={5, 6}
+        snap = mgr.pool_snapshot()
+        tl = snap["tasks"]["TL"]
+        assert snap["epoch"] == 1
+        assert set(tl["promoted"]) == {5, 6, 7, 8, 9}
+        assert len(tl["promoted"]) == mgr.metrics()["curriculum/TL/promoted"]
+        assert tl["hard"] == [0, 1, 2, 3, 4]
+        # easy entries keep the [idx, epoch_added, seq, last_audited] form, recency order
+        assert [entry[0] for entry in tl["easy"]] == tl["promoted"]
+        assert all(len(entry) == 4 for entry in tl["easy"])
+        # pools partition the task; active matches what advance_epoch returned
+        easy_idx = {entry[0] for entry in tl["easy"]}
+        assert easy_idx | set(tl["hard"]) == set(range(10))
+        assert easy_idx & set(tl["hard"]) == set()
+        assert sorted(tl["active"]) == sorted(active)
+        assert set(tl["mixin"]) == {5, 6}
+        # per-sample evidence rides along (str keys, 4-field stats)
+        assert set(snap["stats"]) == {str(i) for i in range(10)}
+        assert all(len(stat) == 4 for stat in snap["stats"].values())
+
+    def test_snapshot_detail_lists_match_metrics(self):
+        # demotion: mixed-in sample 6 regresses
+        mgr = make_manager(["TL"] * 10, easy_top_frac=0.50, demote_easy=True)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        mgr.advance_epoch()
+        record_each(mgr, [6], [9.0], [0.9])
+        mgr.advance_epoch()
+        assert mgr.pool_snapshot()["tasks"]["TL"]["demoted"] == [6]
+
+        # audit slice: pre-phase audit pulls in the stalest easy sample
+        mgr = make_manager(["TL"] * 10, easy_top_frac=0.10, threshold_frac=0.90, audit_frac=0.10)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        mgr.advance_epoch()
+        assert mgr.pool_snapshot()["tasks"]["TL"]["audit"] == [9]
+
+        # per-task floor: whole task promoted -> floor keeps round(0.1*20)=2
+        mgr = make_manager(["TL"] * 20, easy_top_frac=1.0, mixin_ramp=True, task_floor_frac=0.10)
+        record_each(mgr, list(range(20)), [float(i) for i in range(20)], [0.05] * 20)
+        mgr.advance_epoch()
+        tl = mgr.pool_snapshot()["tasks"]["TL"]
+        assert len(tl["floor_topup"]) == mgr.metrics()["curriculum/TL/task_floor"] == 2
+
+        # global min_active_size floor: 5 hard + 2 mixin = 7 -> one extra easy
+        mgr = make_manager(["TL"] * 10, easy_top_frac=0.50, min_active_size=8)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        active = mgr.advance_epoch()
+        snap = mgr.pool_snapshot()
+        assert len(snap["floor_topup_global"]) == 1
+        assert snap["floor_topup_global"][0] in active
+
+    def test_snapshot_is_a_copy(self):
+        mgr = make_manager(["TL"] * 10, easy_top_frac=0.50)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        mgr.advance_epoch()
+        snap = mgr.pool_snapshot()
+        snap["tasks"]["TL"]["hard"].append(99)
+        snap["tasks"]["TL"]["easy"][0][0] = 99
+        snap["tasks"]["TL"]["mixin"].append(99)
+        snap["stats"]["0"][0] = -1.0
+        fresh = mgr.pool_snapshot()
+        assert 99 not in fresh["tasks"]["TL"]["hard"]
+        assert fresh["tasks"]["TL"]["easy"][0][0] != 99
+        assert 99 not in fresh["tasks"]["TL"]["mixin"]
+        assert fresh["stats"]["0"][0] != -1.0
+
+
+class TestPerTaskGate:
+    def test_detection_override_promotes_above_base_gate(self):
+        # error 0.20 clears a per-task detection gate of 0.25 but fails the base 0.10 gate.
+        mgr = make_manager(
+            ["medvision-detection"] * 10,
+            easy_top_frac=0.50,
+            mre_gate=0.10,
+            gate_overrides={"medvision-detection": 0.25},
+        )
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.20] * 10)
+        mgr.advance_epoch()
+        assert mgr.metrics()["curriculum/medvision-detection/promoted"] == 5
+
+    def test_without_override_base_gate_rejects(self):
+        mgr = make_manager(["medvision-detection"] * 10, easy_top_frac=0.50, mre_gate=0.10)
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.20] * 10)
+        mgr.advance_epoch()
+        assert mgr.metrics()["curriculum/medvision-detection/promoted"] == 0
+
+    def test_per_task_gate_isolates_tasks(self):
+        # detection uses 0.25, AD falls back to the base 0.10; both fed error 0.20.
+        labels = ["medvision-detection"] * 10 + ["AD"] * 10
+        mgr = make_manager(
+            labels, easy_top_frac=0.50, mre_gate=0.10, gate_overrides={"medvision-detection": 0.25}
+        )
+        record_each(mgr, list(range(20)), [float(i) for i in range(20)], [0.20] * 20)
+        mgr.advance_epoch()
+        m = mgr.metrics()
+        assert m["curriculum/medvision-detection/promoted"] == 5
+        assert m["curriculum/AD/promoted"] == 0
+
+    def test_demotion_uses_per_task_gate(self):
+        # detection gate 0.25, margin 1.5 -> demote only past error 0.375.
+        mgr = make_manager(
+            ["medvision-detection"] * 10,
+            easy_top_frac=0.50,
+            demote_easy=True,
+            mre_gate=0.10,
+            demote_margin=1.5,
+            gate_overrides={"medvision-detection": 0.25},
+        )
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.20] * 10)
+        mgr.advance_epoch()  # promote 5..9, mix in {5, 6}
+        record_each(mgr, [6], [9.0], [0.40])  # 0.40 >= 0.375 -> regressed
+        mgr.advance_epoch()
+        assert mgr.metrics()["curriculum/medvision-detection/demoted"] == 1
+
+    def test_empty_overrides_uses_base_gate(self):
+        mgr = make_manager(["AD"] * 10, easy_top_frac=0.50, mre_gate=0.10, gate_overrides={})
+        record_each(mgr, list(range(10)), [float(i) for i in range(10)], [0.05] * 10)
+        mgr.advance_epoch()
+        assert mgr.metrics()["curriculum/AD/promoted"] == 5
 
 
 class TestActiveSampleWeights:

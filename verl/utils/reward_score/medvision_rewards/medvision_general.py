@@ -14,18 +14,23 @@
 
 import re
 
-from verl.utils.reward_score.medvision_rewards.reward_fn import (
-    cal_MRE_error,
-    cal_reward_from_error_or_zero,
-    extract_last_k_nums,
+from verl.utils.reward_score.medvision_rewards.medvision_ad import (
+    cal_process_reward_error_v2 as cal_ad_process_reward_error_v2,
+)
+from verl.utils.reward_score.medvision_rewards.medvision_ad import (
+    cal_process_reward_error_v3 as cal_ad_process_reward_error_v3,
 )
 from verl.utils.reward_score.medvision_rewards.medvision_tl import (
     cal_process_reward_error_v2 as cal_tl_process_reward_error_v2,
+)
+from verl.utils.reward_score.medvision_rewards.medvision_tl import (
     cal_process_reward_error_v3 as cal_tl_process_reward_error_v3,
 )
-from verl.utils.reward_score.medvision_rewards.medvision_ad import (
-    cal_process_reward_error_v2 as cal_ad_process_reward_error_v2,
-    cal_process_reward_error_v3 as cal_ad_process_reward_error_v3,
+from verl.utils.reward_score.medvision_rewards.reward_fn import (
+    cal_ciou_reward_error,
+    cal_MRE_error,
+    cal_reward_from_error_or_zero,
+    extract_last_k_nums,
 )
 
 # All supported abilities; all except detection have process (CoT step) rewards
@@ -147,8 +152,10 @@ def cal_format_reward(solution, **kwargs):
 
 def cal_answer_reward_error(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Calculates the MRE (Mean Relative Error) reward and raw MRE from the extracted final answer
-    from the model response (solution).
+    Calculates the answer reward and raw error from the extracted final answer of the
+    model response (solution). The error metric depends on the task: A/D and T/L use MRE
+    (Mean Relative Error) over the scalar/axis-length answer, while detection uses the
+    CIoU overlap error (1 - CIoU) / 2 over the 4 box coordinates.
 
     Args:
         solution: model responses (text)
@@ -156,8 +163,8 @@ def cal_answer_reward_error(solution, ground_truth, reward_mapping_func="exp_dec
         reward_mapping_func: Reward mapping function name.
 
     Returns:
-        A tuple (reward, answer_error) where answer_error is the MRE
-        (NaN if the answer is unparseable).
+        A tuple (reward, answer_error): for A/D and T/L answer_error is the MRE; for
+        detection it is the CIoU overlap error (NaN if the answer is unparseable).
     """
     # Validate ability and determine number of target values based on ability
     ability = kwargs.get("ability")
@@ -216,7 +223,13 @@ def cal_answer_reward_error(solution, ground_truth, reward_mapping_func="exp_dec
         except Exception:
             return 0.0, float("nan")
 
-    # Compute MRE reward
+    # Compute the answer reward/error. Detection scores the 4 box coordinates with CIoU
+    # (overlap-aware and position/scale-fair, unlike coordinate MRE which is biased toward
+    # the origin); the returned answer_error is the overlap error (1 - CIoU) / 2. A/D and
+    # T/L keep MRE over their scalar/axis-length answers.
+    if ability == "medvision-detection":
+        return cal_ciou_reward_error(pred_float, gt_float, reward_mapping_func)
+
     error = cal_MRE_error(pred_float, gt_float)
     reward = cal_reward_from_error_or_zero(error, reward_mapping_func)
 

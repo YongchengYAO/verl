@@ -413,6 +413,7 @@ class RayPPOTrainer:
                 curriculum_config,
                 min_active_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
             )
+            self._dump_curriculum_pools()  # epoch-0 baseline (everything hard)
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -476,12 +477,25 @@ class RayPPOTrainer:
             sampler=sampler,
         )
 
+    def _dump_curriculum_pools(self):
+        """Writes the full pool membership to disk for post-hoc inspection.
+
+        One JSON file per epoch boundary (file N = pools entering epoch N);
+        idempotent on resume since a re-run boundary overwrites the same file.
+        """
+        manager = self.train_dataset.curriculum_manager
+        pools_dir = os.path.join(self.config.trainer.default_local_dir, "curriculum_pools")
+        os.makedirs(pools_dir, exist_ok=True)
+        with open(os.path.join(pools_dir, f"epoch_{manager.epoch:04d}.json"), "w") as f:
+            json.dump(manager.pool_snapshot(), f)
+
     def _advance_curriculum(self, logger):
         """Reclassifies sample pools at an epoch boundary and rebuilds the train dataloader."""
         from verl.utils.dataset.curriculum import build_active_sampler
 
         manager = self.train_dataset.curriculum_manager
         active = self.train_dataset.advance_curriculum()
+        self._dump_curriculum_pools()
         logger.log(data=manager.metrics(), step=self.global_steps)
         if manager.epoch < self.config.trainer.total_epochs:
             sampler = build_active_sampler(self.config.data, self.train_dataset, active, manager.epoch)
@@ -525,6 +539,7 @@ class RayPPOTrainer:
             # process stopped before the epoch-end advance). Run it now from the
             # restored tally and start the next epoch from scratch.
             active = self.train_dataset.advance_curriculum()
+            self._dump_curriculum_pools()
             sampler = build_active_sampler(self.config.data, self.train_dataset, active, manager.epoch)
             self.train_dataloader = self._build_train_dataloader(sampler)
             self._curriculum_epoch_start_step = self.global_steps + 1
@@ -650,7 +665,10 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # "index" (curriculum sample identity) must stay in the trainer-side batch like
+        # "uid": with the reward loop enabled, the agent-loop output does not echo input
+        # non-tensor keys, so a popped "index" would never come back via union().
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "index"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []

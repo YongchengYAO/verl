@@ -84,8 +84,14 @@ class MedVisionDataset(RLHFDataset):
         group_map = parse_task_group_map(curriculum_config.get("task_group_map", None))
         task_labels = [group_map.get(str(label), str(label)) for label in self.dataframe[task_key]]
 
+        # Detection is scored by CIoU overlap error (1-CIoU)/2, not MRE, so it gets its own
+        # promotion gate (matched to IoU>0.5) instead of the MRE<mre_gate bar used by A/D + T/L.
+        detection_gate = curriculum_config.get("detection_gate", None)
+        gate_overrides = {} if detection_gate is None else {"medvision-detection": float(detection_gate)}
+
         self.curriculum_manager = CurriculumManager(
             task_labels,
+            gate_overrides=gate_overrides,
             easy_top_frac=curriculum_config.get("easy_top_frac", 0.20),
             mre_gate=curriculum_config.get("mre_gate", 0.10),
             threshold_frac=curriculum_config.get("threshold_frac", 0.50),
@@ -93,7 +99,7 @@ class MedVisionDataset(RLHFDataset):
             demote_easy=curriculum_config.get("demote_easy", True),
             min_active_size=min_active_size,
             ema_alpha=curriculum_config.get("ema_alpha", 0.4),
-            promote_patience=curriculum_config.get("promote_patience", 2),
+            promote_patience=curriculum_config.get("promote_patience", 1),
             demote_patience=curriculum_config.get("demote_patience", 1),
             demote_margin=curriculum_config.get("demote_margin", 1.5),
             audit_frac=curriculum_config.get("audit_frac", 0.05),
@@ -114,6 +120,12 @@ class MedVisionDataset(RLHFDataset):
             raise RuntimeError(
                 "Curriculum filtering needs per-sample 'answer_error' in the batch, which is only "
                 "populated by the reward loop. Launch with +reward_model.use_reward_loop=True."
+            )
+        if "index" not in non_tensor:
+            raise RuntimeError(
+                "Curriculum filtering needs per-sample 'index' in the batch. It is injected by "
+                "MedVisionDataset.__getitem__ and must be retained in the trainer-side batch by "
+                "_get_gen_batch (the agent-loop output does not echo it when the reward loop is on)."
             )
         scores = batch.batch["token_level_scores"].sum(dim=-1).cpu().tolist()
         self.curriculum_manager.record(non_tensor["index"], scores, non_tensor["answer_error"])

@@ -31,7 +31,7 @@ fi
 
 
 # Define experiment name
-exp_name="medvision__fullRFT__MedVision-VO-7B__multiTask__512x512__PRxAnswer__normL2-max__curriculum__run1"
+exp_name="medvision__fullRFT__MedVision-VO-7B__multiTask__512x512__curriculum__run1"
 
 # Define directories (derived from this script's location: examples/grpo_trainer/ -> repo root is two levels up)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,8 +68,8 @@ temperature_sampler_T=8
 
 # Curriculum sample filtering (epoch-level hard-example mining; see verl/utils/dataset/curriculum.py)
 # At each epoch end, the top 20% of the current training set by EMA reward (gated on
-# EMA answer-MRE < 0.1 and a 2-epoch pass streak) moves to a per-task easy pool and is
-# dropped from training.
+# EMA answer-error < gate: MRE < 0.1 for A/D + T/L; overlap error (1-CIoU)/2 < 0.25 for
+# detection) moves to a per-task easy pool and is dropped from training.
 # A retention mix-in of most-recently-promoted easy samples ramps up with the solved
 # fraction (full 30% easy / 70% hard once 50% of the task is solved), and each task keeps
 # at least 10% of its samples active (anti-extinction floor), so the training set shrinks
@@ -84,15 +84,17 @@ curriculum_threshold_frac=0.50
 curriculum_mixin_easy_frac=0.30
 curriculum_demote_easy=True  # re-demote mixed-in easy samples whose MRE regresses (False: easy is sticky)
 curriculum_ema_alpha=0.4  # EMA weight for per-sample score/error evidence (1.0 = single-epoch evidence)
-curriculum_promote_patience=2  # consecutive passing epochs required to promote (1 = legacy)
+curriculum_promote_patience=1  # consecutive observed passing epochs to promote (2 = stricter, but coverage-limited on big tasks)
 curriculum_demote_patience=1  # consecutive failing audits required to demote
 curriculum_demote_margin=1.5  # demote only past margin*mre_gate (hysteresis vs promotion gate)
 curriculum_audit_frac=0.05  # rotating easy-pool audit slots per epoch, as a fraction of the hard pool
 curriculum_mixin_ramp=True  # ramp the easy mix-in with the solved fraction (False: binary phase at threshold_frac)
 curriculum_task_floor_frac=0.10  # minimum active fraction of each task's original size (anti task-extinction)
+curriculum_detection_gate=0.25  # detection promotion gate on overlap error (1-CIoU)/2; 0.25 <=> EMA CIoU>0.5 (~IoU>0.5)
 
 # (Optional) Custom reward function
 # process reward: max normalized L2 distance for AD/TL localization steps; no process reward for detection
+# answer reward: MRE for AD/TL; CIoU overlap reward exp(-(1-CIoU)/2) for detection (position/scale-fair, not coord-MRE)
 reward_function_path=$verl_dir/verl/utils/reward_score/medvision_rewards/medvision_general.py
 reward_function_name=compute_score_exp_decay_PRxAnswer_v3
 
@@ -208,7 +210,7 @@ if [ "$DRY_RUN" != "1" ]; then
         trainer.experiment_name=$exp_name \
         trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
-        trainer.save_freq=10 \
+        trainer.save_freq=50 \
         trainer.test_freq=10 \
         trainer.total_epochs=$epoch \
         trainer.default_local_dir=$default_local_dir \
@@ -236,6 +238,7 @@ if [ "$DRY_RUN" != "1" ]; then
         +data.curriculum.audit_frac=$curriculum_audit_frac \
         +data.curriculum.mixin_ramp=$curriculum_mixin_ramp \
         +data.curriculum.task_floor_frac=$curriculum_task_floor_frac \
+        +data.curriculum.detection_gate=$curriculum_detection_gate \
         +data.curriculum.task_key=ability \
         "+data.curriculum.task_group_map='medvision-angle:AD,medvision-distance:AD'" \
         $@

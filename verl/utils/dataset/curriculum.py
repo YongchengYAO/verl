@@ -63,12 +63,13 @@ class CurriculumManager:
         demote_easy=True,
         min_active_size=1,
         ema_alpha=0.4,
-        promote_patience=2,
+        promote_patience=1,
         demote_patience=1,
         demote_margin=1.5,
         audit_frac=0.05,
         mixin_ramp=True,
         task_floor_frac=0.10,
+        gate_overrides=None,
     ):
         if not 0.0 < easy_top_frac <= 1.0:
             raise ValueError(f"easy_top_frac must be in (0, 1], got {easy_top_frac}")
@@ -84,6 +85,10 @@ class CurriculumManager:
             raise ValueError(f"audit_frac must be in [0, 1], got {audit_frac}")
         if not 0.0 <= task_floor_frac <= 1.0:
             raise ValueError(f"task_floor_frac must be in [0, 1], got {task_floor_frac}")
+        gate_overrides = dict(gate_overrides or {})
+        for task, gate in gate_overrides.items():
+            if not 0.0 < gate <= 1.0:
+                raise ValueError(f"gate_overrides[{task}] must be in (0, 1], got {gate}")
 
         self.task_labels = [str(label) for label in task_labels]
         self.n_samples = len(self.task_labels)
@@ -100,6 +105,9 @@ class CurriculumManager:
         self.audit_frac = float(audit_frac)
         self.mixin_ramp = bool(mixin_ramp)
         self.task_floor_frac = float(task_floor_frac)
+        # Per-task promotion/demotion gate (task label -> gate). Tasks not listed use
+        # mre_gate. Detection uses an overlap-error gate (1-CIoU)/2 instead of MRE<gate.
+        self.gate_overrides = {str(t): float(g) for t, g in gate_overrides.items()}
 
         self.task_indices = {}
         for i, label in enumerate(self.task_labels):
@@ -118,6 +126,9 @@ class CurriculumManager:
         # persistent per-sample evidence: index -> [ema_score, ema_mre, pass_streak, fail_streak]
         self._stats = {}
         self._last_metrics = {}
+        # per-task transition lists from the most recent advance_epoch (for pool_snapshot)
+        self._last_detail = {}
+        self._last_global_floor = []
 
     @property
     def epoch(self):
@@ -172,24 +183,28 @@ class CurriculumManager:
                 if not math.isnan(mre):
                     # an all-unparsed epoch leaves the error EMA unchanged
                     stat[1] = mre if math.isnan(stat[1]) else alpha * mre + (1.0 - alpha) * stat[1]
-            if not math.isnan(mre) and mre < self.mre_gate:
+            if not math.isnan(mre) and mre < self._gate_for(idx):
                 stat[2] += 1
                 stat[3] = 0
             else:
                 stat[2] = 0
                 stat[3] += 1
 
+    def _gate_for(self, idx):
+        """Promotion gate for a sample's task (per-task override, else the base mre_gate)."""
+        return self.gate_overrides.get(self.task_labels[idx], self.mre_gate)
+
     def _should_promote(self, idx):
         stat = self._stats[idx]
-        return stat[2] >= self.promote_patience and not math.isnan(stat[1]) and stat[1] < self.mre_gate
+        return stat[2] >= self.promote_patience and not math.isnan(stat[1]) and stat[1] < self._gate_for(idx)
 
     def _should_demote(self, idx):
         stat = self._stats[idx]
         if stat[3] < self.demote_patience:
             return False
-        # hysteresis: demotion requires regressing past demote_margin * mre_gate,
+        # hysteresis: demotion requires regressing past demote_margin * gate,
         # strictly worse than the promotion gate, so borderline samples don't oscillate
-        return math.isnan(stat[1]) or stat[1] >= self.demote_margin * self.mre_gate
+        return math.isnan(stat[1]) or stat[1] >= self.demote_margin * self._gate_for(idx)
 
     def advance_epoch(self):
         """Reclassifies pools from this epoch's evidence and returns the next epoch's active set."""
@@ -197,7 +212,7 @@ class CurriculumManager:
         metrics = {}
         for task in self.tasks:
             n_task = len(self.task_indices[task])
-            promoted, demoted = 0, 0
+            promoted, demoted = [], []
 
             # Demotion of regressed easy samples (only mixed-in/audited ones were drawn).
             if self.demote_easy:
@@ -206,7 +221,7 @@ class CurriculumManager:
                     idx = entry[0]
                     if idx in self._tally and self._should_demote(idx):
                         self.hard[task].add(idx)
-                        demoted += 1
+                        demoted.append(idx)
                     else:
                         kept.append(entry)
                 self.easy[task] = kept
@@ -222,7 +237,7 @@ class CurriculumManager:
                     self.hard[task].discard(idx)
                     self.easy[task].append([idx, self._epoch, self._next_seq, self._epoch])
                     self._next_seq += 1
-                    promoted += 1
+                    promoted.append(idx)
 
             # Refresh audit timestamps for easy samples drawn this epoch.
             for entry in self.easy[task]:
@@ -258,23 +273,29 @@ class CurriculumManager:
             # Per-task retention floor: a nearly-solved task keeps a minimum training
             # presence (forgetting tripwire), instead of vanishing as its hard pool
             # (and the hard-pool-proportional mix-in) collapses.
-            floor_topup = 0
+            extras = []
             floor_size = min(n_task, round(self.task_floor_frac * n_task))
             if len(self._active[task]) < floor_size:
                 included = set(self._active[task])
                 extras = [entry[0] for entry in reversed(self.easy[task]) if entry[0] not in included]
                 extras = extras[: floor_size - len(self._active[task])]
                 self._active[task] += extras
-                floor_topup = len(extras)
 
+            self._last_detail[task] = {
+                "promoted": promoted,
+                "demoted": demoted,
+                "mixin": frontier,
+                "audit": audit,
+                "floor_topup": extras,
+            }
             metrics[f"curriculum/{task}/easy_pool"] = len(self.easy[task])
             metrics[f"curriculum/{task}/hard_pool"] = len(self.hard[task])
             metrics[f"curriculum/{task}/active"] = len(self._active[task])
-            metrics[f"curriculum/{task}/promoted"] = promoted
-            metrics[f"curriculum/{task}/demoted"] = demoted
+            metrics[f"curriculum/{task}/promoted"] = len(promoted)
+            metrics[f"curriculum/{task}/demoted"] = len(demoted)
             metrics[f"curriculum/{task}/audited"] = len(audit)
             metrics[f"curriculum/{task}/mixin"] = len(frontier)
-            metrics[f"curriculum/{task}/task_floor"] = floor_topup
+            metrics[f"curriculum/{task}/task_floor"] = len(extras)
 
         self._apply_min_active_floor(metrics)
         metrics["curriculum/active_total"] = sum(len(a) for a in self._active.values())
@@ -285,6 +306,7 @@ class CurriculumManager:
 
     def _apply_min_active_floor(self, metrics):
         """Tops up the global active set with most-recent easy samples to keep >= one batch."""
+        self._last_global_floor = []
         total = sum(len(a) for a in self._active.values())
         shortfall = self.min_active_size - total
         if shortfall <= 0:
@@ -300,11 +322,42 @@ class CurriculumManager:
         spare.sort(reverse=True)  # highest seq = most recently promoted
         for _, task, idx in spare[:shortfall]:
             self._active[task].append(idx)
+            self._last_global_floor.append(idx)
         metrics["curriculum/floor_topup"] = min(shortfall, len(spare))
 
     def metrics(self):
         """Per-task pool/promotion stats from the most recent advance_epoch call."""
         return dict(self._last_metrics)
+
+    def pool_snapshot(self):
+        """Full pool membership for offline inspection (JSON-serializable, read-only).
+
+        The trainer dumps one snapshot per epoch boundary to
+        {trainer.default_local_dir}/curriculum_pools/epoch_{epoch:04d}.json, where
+        `epoch` is the epoch the returned active set trains (0 = the initial
+        all-hard state). Per task: full easy entries ([idx, epoch_added, seq,
+        last_audited], append order = promotion recency), the sorted hard pool, the
+        active set, and this boundary's transition lists (promoted / demoted /
+        mixin / audit / floor_topup; empty before the first advance). `stats` is
+        the per-sample evidence record (idx -> [ema_score, ema_mre, pass_streak,
+        fail_streak]).
+        """
+        detail_keys = ("promoted", "demoted", "mixin", "audit", "floor_topup")
+        tasks = {}
+        for task in self.tasks:
+            detail = self._last_detail.get(task, {})
+            tasks[task] = {
+                "easy": [list(entry) for entry in self.easy[task]],
+                "hard": sorted(self.hard[task]),
+                "active": list(self._active[task]),
+                **{key: list(detail.get(key, [])) for key in detail_keys},
+            }
+        return {
+            "epoch": self._epoch,
+            "tasks": tasks,
+            "floor_topup_global": list(self._last_global_floor),
+            "stats": {str(idx): list(stat) for idx, stat in self._stats.items()},
+        }
 
     def state_dict(self):
         """JSON-serializable state for checkpoint/resume."""

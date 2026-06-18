@@ -42,8 +42,15 @@ Pools are tracked **per task** (task = `ability` column, optionally merged via
 
 During each epoch, every training step tallies, per sample index, the rollout-level
 `score` (sequence reward = `token_level_scores.sum(-1)`, i.e. pre-KL) and
-`answer_error` (final-answer MRE from the reward function). All rollouts of all draws
-of a sample within the epoch aggregate into one mean each.
+`answer_error` (final-answer error from the reward function — MRE for A/D + T/L,
+overlap error `(1 - CIoU)/2` for detection). All rollouts of all draws of a sample
+within the epoch aggregate into one mean each.
+
+> **Per-task gate.** The "easy" threshold is per task via `gate_overrides`: A/D and T/L
+> use `mre_gate` (0.10) on MRE, while detection uses `detection_gate` (0.25) on its
+> overlap error `(1 - CIoU)/2` — i.e. `EMA CIoU > 0.5`, matched to the benchmark's
+> IoU>0.5. Everything below that says "MRE < mre_gate" applies with each task's own gate
+> substituted; the machinery (ranking, streaks, hysteresis) is identical.
 
 At the **end of each epoch**, the tally is first folded into a **persistent per-sample
 evidence record** (see *Promotion and demotion evidence* below), then per task:
@@ -94,8 +101,8 @@ generation batch) tops up with most-recently-promoted easy samples if the union 
 falls below one batch — `drop_last=True` would otherwise produce a zero-step epoch.
 
 Epoch 1 always trains the full dataset (there are no metrics yet); with the default
-`promote_patience=2` the first promotions land at the end of epoch 2 and filtering
-takes effect from epoch 3.
+`promote_patience=1` the first promotions land at its end and filtering takes effect
+from epoch 2.
 
 **Recency as a difficulty frontier.** Promotees are appended best-score-first, so the
 end of `easy[t]` always holds the *lowest-margin* recently-solved samples. The
@@ -109,17 +116,16 @@ Simulated on a scaled-down MedVision mix (1100 Detection / 55 A/D / 55 T/L), def
 parameters, sample "skill" improving over epochs:
 
 ```
-epoch  0: active=1210   D(easy/hard)=0/1100     AD=0/55    TL=0/55    mixin=0    floor=0    <- patience: evidence only
-epoch  1: active=1148   D(easy/hard)=220/880    AD=11/44   TL=11/44   mixin=132  floor=0    <- first promotions, ramp starts
-epoch  3: active=  925   D(easy/hard)=517/583    AD=29/26   TL=21/34   mixin=250  floor=0    <- ramp near full strength
-epoch  6: active=  525   D(easy/hard)=780/320    AD=37/18   TL=38/17   mixin=152  floor=0
-epoch 11: active=  124   D(easy/hard)=1043/57    AD=50/5    TL=50/5    mixin=28   floor=26   <- Detection held at 10% of N_t
+epoch  0: active=1148   D(easy/hard)=220/880    AD=11/44   TL=11/44   mixin=132  floor=0    <- first promotions, ramp starts
+epoch  3: active=  922   D(easy/hard)=519/581    AD=29/26   TL=23/32   mixin=251  floor=0    <- ramp near full strength
+epoch  6: active=  542   D(easy/hard)=769/331    AD=36/19   TL=39/16   mixin=157  floor=0
+epoch 11: active=  123   D(easy/hard)=1042/58    AD=50/5    TL=51/4    mixin=29   floor=24   <- Detection held at 10% of N_t
 ```
 
 Note the absence of any jump: under the binary phase the active set leapt +146
 samples in one epoch when Detection crossed 50%; the ramp grows the mix-in smoothly
-from the first promotions. At epoch 11 the floor binds for Detection (57 hard +
-24 mix-in + 3 audit = 84 < 110 = 0.10 × 1100), holding the task at 110 active.
+from the first promotions. At epoch 11 the floor binds for Detection (58 hard +
+25 mix-in + 3 audit = 86 < 110 = 0.10 × 1100), holding the task at 110 active.
 
 ## Promotion and demotion evidence (EMA + patience + hysteresis)
 
@@ -137,7 +143,10 @@ At every epoch end, each drawn sample's epoch means are folded in:
 - `ema_score / ema_mre` — exponential moving averages with weight `ema_alpha`
   (default 0.4): `ema ← α·epoch_mean + (1−α)·ema`. One bad epoch leaves a shadow that
   several good epochs must wash out before the gate opens. An all-unparsed epoch
-  (NaN MRE) leaves the error EMA unchanged but still counts as a failure below.
+  (NaN error) leaves the error EMA unchanged but still counts as a failure below.
+  (`ema_mre` holds whatever `answer_error` the reward emits for the task — MRE for
+  A/D + T/L, overlap error `(1-CIoU)/2` for detection — so in pool snapshots a
+  detection sample's `ema_mre` is its overlap error, not an MRE.)
 - `pass_streak / fail_streak` — counts of *consecutive observed* epochs whose epoch-mean
   MRE passed / failed the gate. **Undrawn epochs hold the streaks** (absence of
   evidence is not evidence) — under replacement sampling a sample can legitimately go
@@ -145,19 +154,23 @@ At every epoch end, each drawn sample's epoch means are folded in:
 
 Decision rules:
 
-- **Promotion** requires `pass_streak ≥ promote_patience` (default 2 — "solved for two
-  consecutive observed epochs") **and** `ema_mre < mre_gate`, on top of ranking in the
-  top `easy_top_frac` by `ema_score`. The patience requirement is what averages out
-  rollout luck; the EMA gate is what remembers history.
+- **Promotion** requires `pass_streak ≥ promote_patience` (default 1) **and**
+  `ema_mre < mre_gate`, on top of ranking in the top `easy_top_frac` by `ema_score`.
+  With patience 1 the anti-luck burden is carried by the EMA gate (one bad epoch
+  leaves a shadow that several good epochs must wash out) and by the competitive
+  top-fraction cap. Raise to 2 ("solved for two consecutive observed epochs") for
+  stricter evidence — but only where per-task sampling coverage is high (see Known
+  limitations: under temperature rebalancing, large tasks may be observed too rarely
+  for multi-epoch streaks to accumulate in a short run).
 - **Demotion** requires `fail_streak ≥ demote_patience` (default 1) **and**
   `ema_mre ≥ demote_margin × mre_gate` (default 1.5 → demote at EMA MRE ≥ 0.15 while
   promotion needs < 0.10). The margin is classic **hysteresis**: a sample hovering at
   MRE ≈ 0.10 cannot oscillate hard→easy→hard across a single boundary.
 
-The asymmetry (patience 2 up, patience 1 down) is deliberate: leaving training is
-near-irreversible and demands strong evidence; returning to training is cheap, and a
-forgotten sample should come back **fast** — audits visit any given easy sample rarely,
-so requiring multiple failed audits would stretch the response time by many epochs.
+Demotion keeps patience 1 for the same coverage reason: audits visit any given easy
+sample rarely, so requiring multiple failed audits would stretch the forgetting
+response by many epochs. Returning to training is cheap anyway — hysteresis, not
+patience, is the churn guard on the demotion side.
 
 Setting `ema_alpha=1, promote_patience=1, demote_patience=1, demote_margin=1,
 audit_frac=0` reproduces the original single-epoch behavior exactly (the unit tests
@@ -188,15 +201,16 @@ sample's rollouts per epoch).
 
 | Knob | Default | Rationale |
 |---|---|---|
-| `mre_gate` | 0.10 | Matches the MedVision benchmark's own success criterion (MRE < 0.1): "easy" = "passes the paper's metric". |
+| `mre_gate` | 0.10 | Matches the MedVision benchmark's own success criterion (MRE < 0.1): "easy" = "passes the paper's metric". A/D + T/L only. |
+| `detection_gate` | 0.25 | Detection is scored by CIoU, not MRE; its overlap error `(1-CIoU)/2 < 0.25` ⇔ `EMA CIoU > 0.5`. Since CIoU ≤ IoU, this implies IoU > 0.5 (the benchmark's detection bar) plus decent centering/aspect. |
 | `easy_top_frac` | 0.20 | At most 20% of the (shrinking) set migrates per epoch → cumulative cap ≈ `1 − 0.8^k` after k promoting epochs, so the 50% mix-in threshold is reachable from ~epoch 4-5 and the curriculum fully engages within a 10-epoch run. For long runs or noisy rewards, 0.10 is the conservative choice (promotion competition is twice as strict). |
 | `threshold_frac` | 0.50 | Solved fraction at which the ramped mix-in reaches full strength. Below it, retention scales proportionally — there is no longer a point where retention is absent. |
 | `mixin_easy_frac` | 0.30 | Mid-range of replay ratios used against catastrophic forgetting (commonly 10–50%); the ramp's ceiling. |
 | `mixin_ramp` | True | Ramp retention with the solved fraction instead of a binary phase flip: no retention gap before the threshold, no one-epoch training-set jump at it, no flapping when demotions cross it. `False` = legacy binary phase. |
 | `task_floor_frac` | 0.10 | Anti-extinction: each task keeps ≥10% of its original samples active. A solved task's GRPO groups carry ~zero advantage (cheap), but keep the task in-distribution and trip the demotion rule if forgetting starts. |
 | `ema_alpha` | 0.4 | Effective memory ≈ 2.5 epochs: smooths single-epoch rollout luck without reacting sluggishly to real improvement. `1.0` = no memory. |
-| `promote_patience` | 2 | "Two consecutive passing epochs" — the standard cure for one-epoch noise. Costs one epoch of delayed shrink (first promotions at epoch 2 instead of 1). |
-| `demote_patience` | 1 | Asymmetric on purpose: audits are infrequent per sample, so demotion must act on the first confirmed failure; hysteresis (not patience) is the churn guard. |
+| `promote_patience` | 1 | Multi-epoch streaks assume the sample is observed every epoch — under temperature rebalancing a large task may be seen only ~⅓ of epochs, so patience 2 would throttle its filtering for most of a short run. The EMA gate + competitive cap carry the anti-luck burden instead; raise to 2 on long runs with high per-task coverage. |
+| `demote_patience` | 1 | Audits are infrequent per sample, so demotion must act on the first confirmed failure; hysteresis (not patience) is the churn guard. |
 | `demote_margin` | 1.5 | Demote at EMA MRE ≥ 0.15 vs promote at < 0.10: wide enough that boundary samples don't oscillate, tight enough to catch genuine regressions. 2.0 would only catch gross forgetting. |
 | `audit_frac` | 0.05 | ≈ 5% rollout overhead for continuous easy-pool re-validation. The staleness bound scales as `|easy|/(0.05·|hard|)` epochs — raise it for long runs with large easy pools. |
 
@@ -209,14 +223,15 @@ the temperature sampler — the structured `algorithm` config is not touched):
 |---|---|---|
 | `+data.curriculum.enable` | `False` | Master switch; off = byte-identical to stock training |
 | `+data.curriculum.easy_top_frac` | `0.20` | Top fraction of the *current* training set (per task) eligible for promotion each epoch |
-| `+data.curriculum.mre_gate` | `0.10` | Mean answer-MRE a sample must beat to be classified easy |
+| `+data.curriculum.mre_gate` | `0.10` | Mean answer-MRE a sample must beat to be classified easy (A/D + T/L) |
+| `+data.curriculum.detection_gate` | `0.25` | Easy threshold for detection on its overlap error `(1-CIoU)/2` (⇔ EMA CIoU > 0.5 ≈ IoU > 0.5); unset = detection uses `mre_gate` |
 | `+data.curriculum.threshold_frac` | `0.50` | Solved fraction at which the ramped mix-in reaches full `mixin_easy_frac` strength |
 | `+data.curriculum.mixin_easy_frac` | `0.30` | Maximum easy share of a task's training set (the ramp's ceiling) |
 | `+data.curriculum.mixin_ramp` | `True` | Ramp retention with the solved fraction (`False` = legacy binary phase at the threshold) |
 | `+data.curriculum.task_floor_frac` | `0.10` | Minimum active fraction of each task's original size (anti task-extinction; `0` = off) |
 | `+data.curriculum.demote_easy` | `True` | Re-demote mixed-in/audited easy samples that regress (`False` = easy is sticky) |
 | `+data.curriculum.ema_alpha` | `0.4` | EMA weight for the per-sample score/error evidence (`1.0` = single-epoch evidence) |
-| `+data.curriculum.promote_patience` | `2` | Consecutive passing (observed) epochs required before promotion |
+| `+data.curriculum.promote_patience` | `1` | Consecutive passing (observed) epochs required before promotion |
 | `+data.curriculum.demote_patience` | `1` | Consecutive failing audits required before demotion |
 | `+data.curriculum.demote_margin` | `1.5` | Hysteresis: demote only at EMA MRE ≥ `margin × mre_gate` |
 | `+data.curriculum.audit_frac` | `0.05` | Rotating easy-pool audit slots per epoch, as a fraction of the hard pool |
@@ -304,6 +319,84 @@ The console also prints `[Info] Curriculum epoch E: active set N samples, S step
 after every rebuild. `curriculum.json` doubles as an offline analysis artifact —
 which samples were learned at which epoch.
 
+### Pool snapshot logging
+
+The counts above answer "how big are the pools"; for *which samples* are in each
+pool, the trainer also writes the full membership to disk at every epoch boundary:
+
+```
+{trainer.default_local_dir}/curriculum_pools/epoch_{N:04d}.json
+```
+
+File `N` describes the pools *entering* epoch `N`: `epoch_0000.json` is the initial
+all-hard baseline (written at startup), and each later file is written right after
+the epoch-end reclassification (including the one re-run on resume at an epoch
+boundary, so files are idempotent across restarts). Schema:
+
+```json
+{
+  "epoch": 3,
+  "tasks": {
+    "AD": {
+      "easy":   [[idx, epoch_added, seq, last_audited], ...],
+      "hard":   [idx, ...],
+      "active": [idx, ...],
+      "promoted": [idx, ...], "demoted": [idx, ...],
+      "mixin": [idx, ...], "audit": [idx, ...], "floor_topup": [idx, ...]
+    }
+  },
+  "floor_topup_global": [idx, ...],
+  "stats": {"<idx>": [ema_score, ema_mre, pass_streak, fail_streak], ...}
+}
+```
+
+`easy` entries are in promotion-recency order (`epoch_added` = when the sample was
+promoted); `hard` is sorted; the transition lists (`promoted`/`demoted`/`mixin`/
+`audit`/`floor_topup`) are this boundary's events, matching the count metrics above.
+`stats` carries the per-sample evidence, so pool-level error distributions need no
+re-derivation. On the 121K mix a file is a few MB (hard-pool lists plus stats),
+i.e. tens of MB for a 10-epoch run.
+
+**What `idx` is.** Every index is the sample's *row position in the loaded training
+dataset* — after the parquet files are read and (if enabled) prompt-length
+filtering is applied. It is the integer the dataloader passes to
+`__getitem__`, injected as `non_tensor_batch["index"]`, and it is the single
+identity used everywhere in the curriculum (tally, pools, stats, active set).
+Within a run it is a unique case identifier: each sample has exactly one `idx` in
+`0..N-1`, an `idx` is in exactly one of easy/hard per epoch, and it stays stable
+across checkpoint resume (the `task_counts` fingerprint in `curriculum.json`
+refuses to resume if the dataset changed, since positions would silently
+re-number). It is *not* a content-based MedVision case/taskID: it is only
+meaningful relative to the exact data files, their order, and the same filtering
+settings. To recover the real case, load the same parquet(s) in the same order and
+look up the row (with `filter_overlong_prompts=False`, raw row order = `idx`;
+otherwise re-apply the identical filter first):
+
+```python
+import datasets, glob
+ds = datasets.load_dataset(
+    "parquet", data_files=sorted(glob.glob(f"{DATASET_ROOT}/train*.parquet")), split="train"
+)
+row = ds[4711]  # -> row["ability"], row["extra_info"], the prompt, ...
+```
+
+Example — plot pool sizes and the easy-pool EMA-MRE distribution over epochs:
+
+```python
+import glob, json
+import matplotlib.pyplot as plt
+
+snaps = [json.load(open(p)) for p in sorted(glob.glob("checkpoints/.../curriculum_pools/epoch_*.json"))]
+for task in snaps[0]["tasks"]:
+    plt.plot([len(s["tasks"][task]["easy"]) for s in snaps], label=f"{task} easy")
+    plt.plot([len(s["tasks"][task]["hard"]) for s in snaps], "--", label=f"{task} hard")
+plt.xlabel("epoch"); plt.ylabel("pool size"); plt.legend(); plt.show()
+
+last = snaps[-1]
+easy_mre = [last["stats"][str(e[0])][1] for t in last["tasks"].values() for e in t["easy"] if str(e[0]) in last["stats"]]
+plt.hist(easy_mre, bins=50); plt.xlabel("EMA answer MRE (easy pool)"); plt.show()
+```
+
 ## Known limitations
 
 - **LR schedule horizon.** verl precomputes `total_training_steps = len(dataloader) ×
@@ -326,10 +419,14 @@ which samples were learned at which epoch.
   drift detection. Set `task_floor_frac=0` to reclaim the compute if task extinction
   is acceptable (e.g. single-task runs, where the global `min_active_size` floor
   already applies).
-- **Patience delays the shrink.** `promote_patience=2` postpones all filtering by one
-  epoch and slows the easy-pool growth curve — on very short runs (≲5 epochs) the
-  curriculum may barely engage; drop to `promote_patience=1` there, accepting noisier
-  promotion.
+- **Sampling coverage throttles patience on under-sampled tasks.**
+  `promote_patience=2` requires two observed passing epochs. For AD/TL that's
+  satisfied by epoch 2; for a typical Detection sample, just accumulating two
+  observations takes ~5 epochs (with temperature sampling at T=8 on the 121K mix,
+  only ~37% of Detection samples are drawn per epoch). So in a 10-epoch run, AD/TL
+  filter at full speed while Detection's easy pool grows slowly. This is why the
+  default is `promote_patience=1`; raise it only when every task is observed (nearly)
+  every epoch.
 - **No "too hard" filtering.** Samples the policy *never* solves stay in the hard pool
   forever. In GRPO these all-fail groups also have ~zero advantage, so the late-stage
   hard pool can concentrate compute on unlearnable (or mislabeled) samples. DAPO-style
