@@ -153,3 +153,6 @@ dev-*
 
 # graphify tooling output
 graphify-out/
+
+# local model folder
+examples/grpo_trainer/models/
