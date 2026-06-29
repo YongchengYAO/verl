@@ -31,7 +31,7 @@ fi
 
 
 # Define experiment name
-exp_name="medvision__fullRFT__MedVision-VO-7B__multiTask__512x512__curriculum__run1"
+exp_name="medvision__fullRFT__MedVision-V0-7B__multiTask__512x512__curriculum__run2"
 
 # Define directories (derived from this script's location: examples/grpo_trainer/ -> repo root is two levels up)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +44,7 @@ default_local_dir=$workspace_root/checkpoints/medvision_multi_tasks/$exp_name
 
 # Data
 # Check MedVision on how to prepare the verl datasets: https://github.com/YongchengYAO/MedVision
-# This script expects dataset variant: ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512
+# This script expects dataset variant: ds__AD5500_D110000_TL5500_all121000__resized-hw-512x512
 dataset_root="${DATASET_ROOT:?Set DATASET_ROOT to your prepared verl dataset directory (see https://github.com/YongchengYAO/MedVision)}"
 if ls "$dataset_root/shards/"train_shard_*.parquet 1>/dev/null 2>&1; then
     dataset_train="$dataset_root/shards/train_shard_*.parquet"
@@ -174,7 +174,7 @@ if [ "$DRY_RUN" != "1" ]; then
         data.train_batch_size=256 \
         data.max_prompt_length=4096 \
         data.max_response_length=4096 \
-        data.filter_overlong_prompts=False \
+        data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.image_key=images \
         actor_rollout_ref.model.path=$base_model_hf \
@@ -242,8 +242,18 @@ if [ "$DRY_RUN" != "1" ]; then
         +data.curriculum.task_key=ability \
         "+data.curriculum.task_group_map='medvision-angle:AD,medvision-distance:AD'" \
         $@
+    train_status=$?
 else
     echo "(DRY_RUN) would run training: python3 -m verl.trainer.main_ppo with dataset_train=$dataset_train dataset_val=$dataset_val"
+    train_status=0
+fi
+
+# Skip the checkpoint merge if training did not finish cleanly, so we never merge a
+# stale/older checkpoint after a crash (this script has no `set -e`, so without this
+# guard it would fall through to the merge step regardless of the training exit code).
+if [ "$train_status" -ne 0 ]; then
+    echo "ERROR: training exited with status $train_status; skipping checkpoint merge."
+    exit "$train_status"
 fi
 
 

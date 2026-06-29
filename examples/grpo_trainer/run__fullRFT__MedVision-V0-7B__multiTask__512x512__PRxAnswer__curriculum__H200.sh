@@ -28,7 +28,8 @@
 #   ppo_mini_batch_size ........... 128
 #   ppo_micro_batch_size_per_gpu .. 4 (actor; log-prob/ref micro = 4)
 #   rollout.n ..................... 8 rollouts per prompt (GRPO group size)
-#   max_prompt / max_response ..... 4096 / 4096 tokens (truncation='error')
+#   max_prompt / max_response ..... 4096 / 4096 tokens (filter_overlong_prompts=True
+#                                   drops any sample over 4096; truncation='error' backstop)
 #   lr ............................ 3e-6, constant (no decay -> immune to the
 #                                   shrinking-epoch LR-horizon caveat)
 #   KL ............................ kl_loss_coef=0.01 (low_var_kl); use_kl_in_reward=False
@@ -41,13 +42,20 @@
 #                                   for detection), async reward loop enabled (required by
 #                                   the curriculum for per-sample answer_error)
 #   seed .......................... 1024
-#   save_freq / test_freq ......... every 10 steps (step-based: relatively denser
-#                                   per epoch as epochs shrink)
+#   save_freq / test_freq ......... save every 50 / test every 10 steps (step-based:
+#                                   relatively denser per epoch as epochs shrink)
 #
 # Temperature multitask sampler (composes with the curriculum):
 #   T=8 over `ability`, angle+distance merged into AD via task_group_map
 #   -> Detection 42.1% / AD 29.0% / TL 29.0% of draws per epoch; weights are
 #   recomputed on the curriculum's active subset each epoch, reseeded seed+epoch.
+#   Task share = count^(1/T) normalized (counts: Detection 110K, AD 5.5K, TL 5.5K).
+#   Raising T flattens toward uniform (33.3% each); lowering it toward count-
+#   proportional (Detection ~91% at T=1). T=10 -> Detection 40.3% / AD 29.9% /
+#   TL 29.9%: a mild ~1.8pt shift off Detection onto AD/TL vs T=8. Per-sample
+#   coverage barely moves (Detection ~37%->~36% observed/epoch; AD/TL stay ~100%
+#   at ~6.6 draws/sample), so T=10 does not meaningfully relax the Detection
+#   coverage limit on promote_patience noted above.
 #
 # Curriculum sample filtering (all defaults; see CURRICULUM_FILTERING.md):
 #   enable ............ True

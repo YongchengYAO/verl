@@ -20,6 +20,10 @@ if [ -f "$HF_TOKEN_FILE" ]; then
 else
     echo "WARNING: HF token file not found at $HF_TOKEN_FILE. Private model downloads may fail."
 fi
+# Pod-injected HF_TOKEN may carry a trailing newline, which is illegal in HTTP auth headers (breaks vLLM/HF Hub requests)
+if [ -n "${HF_TOKEN:-}" ]; then
+    export HF_TOKEN="$(printf '%s' "$HF_TOKEN" | tr -d '[:space:]')"
+fi
 
 
 # NOTE: conda env creation/installation and CUDA library-path setup happen after the
@@ -135,7 +139,7 @@ if [ "$DRY_RUN" != "1" ]; then
         data.train_batch_size=256 \
         data.max_prompt_length=4096 \
         data.max_response_length=4096 \
-        data.filter_overlong_prompts=False \
+        data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.image_key=images \
         actor_rollout_ref.model.path=$base_model_hf \
@@ -182,8 +186,18 @@ if [ "$DRY_RUN" != "1" ]; then
         data.custom_cls.path=$custom_cls_path \
         data.custom_cls.name=$custom_cls_name \
         $@
+    train_status=$?
 else
     echo "(DRY_RUN) would run training: python3 -m verl.trainer.main_ppo with dataset_train=$dataset_train dataset_val=$dataset_val"
+    train_status=0
+fi
+
+# Skip the checkpoint merge if training did not finish cleanly, so we never merge a
+# stale/older checkpoint after a crash (this script has no `set -e`, so without this
+# guard it would fall through to the merge step regardless of the training exit code).
+if [ "$train_status" -ne 0 ]; then
+    echo "ERROR: training exited with status $train_status; skipping checkpoint merge."
+    exit "$train_status"
 fi
 
 

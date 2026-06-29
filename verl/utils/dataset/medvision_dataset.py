@@ -23,6 +23,7 @@ from omegaconf import DictConfig
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.utils.tokenizer import build_multimodal_processor_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -177,16 +178,27 @@ class MedVisionDataset(RLHFDataset):
 
                         if video_key in doc and doc[video_key]:
                             raise NotImplementedError("Video processing is not implemented in MedVisionDataset.")
-                        else:
-                            videos = None
-                            videos_kwargs = {}
 
+                        if images is None:
+                            # text-only prompt: count tokens via the tokenizer directly
+                            return len(
+                                processor.tokenizer(
+                                    text=raw_prompt,
+                                    add_special_tokens=False,  # avoid adding special tokens
+                                    return_attention_mask=False,
+                                )["input_ids"]
+                            )
+                        # multimodal prompt: route through the maintained helper (mirrors RLHFDataset);
+                        # the pre-resized images are passed straight through, so MedVisionDataset still
+                        # does not re-resize.
                         return len(
-                            processor(
+                            build_multimodal_processor_inputs(
+                                processor,
                                 text=[raw_prompt],
                                 images=images,
-                                videos=videos,
-                                videos_kwargs=videos_kwargs,
+                                videos=None,
+                                audio=None,
+                                mm_processor_kwargs=self.mm_processor_kwargs,
                             )["input_ids"][0]
                         )
                     except Exception:
