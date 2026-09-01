@@ -1,3 +1,21 @@
+# MedVision RFT recipes
+
+The `train__rft-*.sh` scripts in this directory are the GRPO recipes of the
+[MedVision paper](https://arxiv.org/abs/2511.18676): `train__rft-sequential__{1-AD,2-TL,3-detection}.sh`
+(the sequential RFT that produced MedVision-V0), `train__rft-multitask.sh` (single-stage multi-task
+RFT with temperature-scaled task mixing and epoch-level curriculum learning) and
+`train__rft-multitask__additive-reward.sh` (the additive-reward ablation). The recipe ↔ paper table and
+the environment variables they take (`DATASET_ROOT`, `BASE_MODEL_PATH` / `BASE_MODEL_HF`, `EXP_NAME`,
+`ENGINE`, `ENV_NAME`, `DRY_RUN`) are in the repo-root [README](../../README.md#training-recipes--examplesgrpo_trainer);
+the curriculum is documented in [`../../CURRICULUM_FILTERING.md`](../../CURRICULUM_FILTERING.md).
+`download_hf_model.py` fetches a Hub base model (`BASE_MODEL_HF`) into `models/` for the scripts, and
+`curriculum-learning/plot_curriculum_pools.py` renders a run's `curriculum_pools/` snapshots.
+
+The upstream verl GRPO example scripts were moved to [`unused/`](./unused/); the upstream notes
+on GRPO follow.
+
+---
+
 # Group Relative Policy Optimization (GRPO)
 
 In reinforcement learning, classic algorithms like PPO rely on a "critic" model to estimate the value of actions, guiding the learning process. However, training this critic model can be resource-intensive.

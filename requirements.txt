@@ -15,7 +15,9 @@ pre-commit
 ray[default]
 tensordict>=0.8.0,<=0.10.0,!=0.9.0
 torchdata
-transformers
+# <5: the model merger writes config/processor metadata with the active transformers, and 5.x
+# emits nested Qwen2.5-VL configs that the pinned eval stack (4.54.1 + vLLM 0.10.0) cannot read.
+transformers<5
 # vllm==0.8.4
 wandb
 packaging>=20.0

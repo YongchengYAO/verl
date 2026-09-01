@@ -1,7 +1,33 @@
 #! /bin/bash
+# ================================================================================================
+# MedVision RFT (GRPO) -- sequential stage 3 of 3: detection RFT
+#
+# Settings:
+#   experiment ....... MedVision-V0 stage 3: detection RFT -> MedVision-V0 (the paper's model is global_step_250 of this stage)
+#   base model ....... stage 2's checkpoints/<EXP_NAME>/global_step_<N>/actor/merged_hf_model
+#   dataset variant .. ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512 (1M detection set, shards/)
+#   reward ........... format_reward=soft, composition=multiplicative
+#
+# Usage:
+#   DATASET_ROOT=<data_dir>/verl_datasets/qwen25vl/ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512 \
+#   BASE_MODEL_PATH=examples/grpo_trainer/checkpoints/rft-sequential__2-TL/global_step_<N>/actor/merged_hf_model \
+#   bash examples/grpo_trainer/train__rft-sequential__3-detection.sh
+#
+# Environment variables:
+#   DATASET_ROOT     prepared verl dataset directory (required; see https://github.com/YongchengYAO/MedVision#-training-rft)
+#   BASE_MODEL_PATH  local checkpoint directory                                  -- exactly one of
+#   BASE_MODEL_HF    Hugging Face repo id, downloaded into models/<name> first   -- the two
+#   EXP_NAME         experiment name (default: rft-sequential__3-detection); checkpoints and logs land under
+#                    checkpoints|log/<EXP_NAME>; reuse a name to resume that run
+#   ENGINE           rollout engine (default: vllm)
+#   ENV_NAME         conda env name (default: verl)
+#   DRY_RUN=1        print the actions (env setup, model download, training command, merge) without running them
+# Trailing arguments are Hydra overrides for verl.trainer.main_ppo, e.g. trainer.total_epochs=5.
+# Reward options: ../../REWARDS.md; recipe table and paper mapping: ../../README.md.
+# ================================================================================================
 
 set -x
-ENGINE=${1:-vllm}
+ENGINE=${ENGINE:-vllm}
 # If DRY_RUN=1, script will skip heavy setup and training steps and only print actions.
 DRY_RUN=${DRY_RUN:-0}
 if [ "$DRY_RUN" = "1" ]; then
@@ -30,17 +56,17 @@ fi
 # experiment config below (see "Set up env") so the env exists before we activate it.
 
 
-# Define experiment name
-exp_name="medvision__fullRFT__qwen25vl-7b-fullSFT__multiTask__512x512__PRxAnswer__normL2-mean"
+# Experiment name (see the header): checkpoints|log/$exp_name; reuse a name to resume.
+exp_name="${EXP_NAME:-rft-sequential__3-detection}"
 
 # Define directories (derived from this script's location: examples/grpo_trainer/ -> repo root is two levels up)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 verl_dir="$(cd "$script_dir/../.." && pwd)"
 workspace_root="$script_dir"
 log_root=$workspace_root/log
-rollout_data_dir=$log_root/medvision_multi_tasks/$exp_name/rollout_data
-validation_data_dir=$log_root/medvision_multi_tasks/$exp_name/validation_data
-default_local_dir=$workspace_root/checkpoints/medvision_multi_tasks/$exp_name
+rollout_data_dir=$log_root/$exp_name/rollout_data
+validation_data_dir=$log_root/$exp_name/validation_data
+default_local_dir=$workspace_root/checkpoints/$exp_name
 
 # Data
 # Check MedVision on how to prepare the verl datasets: https://github.com/YongchengYAO/MedVision
@@ -53,23 +79,34 @@ else
 fi
 dataset_val=$dataset_root/validation_verl.parquet
 
-# Model: HF model id or local checkpoint path (this stage continues from the AD-TL RFT checkpoint)
-base_model_hf="${BASE_MODEL:?Set BASE_MODEL to a HF model id or local checkpoint path}"
+# Base model -- set exactly one of:
+#   BASE_MODEL_PATH  local checkpoint directory (stage 2's global_step_N/actor/merged_hf_model)
+#   BASE_MODEL_HF    Hugging Face repo id, downloaded once into models/<name> and trained from that local copy.
+#                    Never hand a Hub id to verl directly: ~15 Ray/vLLM workers fetch it concurrently, and one
+#                    transient hub failure leaves a vLLM server without a processor -> CUDA device-side assert.
+if [ -n "${BASE_MODEL_PATH:-}" ] && [ -n "${BASE_MODEL_HF:-}" ]; then
+    echo "ERROR: set only one of BASE_MODEL_PATH and BASE_MODEL_HF"; exit 1
+fi
+if [ -n "${BASE_MODEL_PATH:-}" ]; then
+    base_model_dir="$BASE_MODEL_PATH"
+    base_model_download_hf=""
+else
+    base_model_download_hf="${BASE_MODEL_HF:?Set BASE_MODEL_PATH (local checkpoint dir) or BASE_MODEL_HF (Hugging Face repo id)}"
+    base_model_dir="$script_dir/models/$(basename "$base_model_download_hf")"
+fi
 
 # Training
 epoch=10
 
-# Temperature-based multitask sampler (rebalances task sampling like SFT's TemperatureSamplerSFTTrainer)
-# T=1: proportional to task counts (no rebalancing); larger T flattens task probabilities; SFT used T=5
-# T=8 on the 110K/5.5K/5.5K mix -> Detection 42.1%, AD 29.0%, TL 29.0% per epoch
-# Tasks are grouped via task_group_map: angle + distance merged into one AD task (matches SFT's AD/Detection/TL)
-temperature_sampler_enable=True
-temperature_sampler_T=8
-
-# (Optional) Custom reward function
-# process reward: mean normalized L2 distance for AD/TL localization steps; no process reward for detection
+# Reward (see REWARDS.md): one entry point configured through reward_kwargs (Hydra overrides below).
+#   format_reward ... soft (default: 0.8 * reasoning-structure score + 0.2 * answer-format check) | binary
+#   composition ..... multiplicative (default: r = format + process * answer) | additive (r = format + process + answer)
+#   process reward: worst-point localization error of the CoT steps (A/D, T/L); answer reward: relative error (A/D, T/L)
+#   or CIoU overlap error (detection, which has no process reward: r = format + answer)
 reward_function_path=$verl_dir/verl/utils/reward_score/medvision_rewards/medvision_general.py
-reward_function_name=compute_score_exp_decay_PRxAnswer_v2
+reward_function_name=compute_score
+reward_format=soft
+reward_composition=multiplicative
 
 # (Optional) Custom dataset class
 custom_cls_path=$verl_dir/verl/utils/dataset/medvision_dataset.py
@@ -89,6 +126,16 @@ fi
 eval "$(conda shell.bash hook)"
 conda activate "${ENV_NAME:-verl}"
 
+# Fetch the Hub base model into its local directory (idempotent; see BASE_MODEL_HF above).
+if [ -n "$base_model_download_hf" ]; then
+    if [ "$DRY_RUN" != "1" ]; then
+        python "$script_dir/download_hf_model.py" --repo_id "$base_model_download_hf" --local_dir "$base_model_dir" \
+            || { echo "ERROR: model download failed"; exit 1; }
+    else
+        echo "(DRY_RUN) would download $base_model_download_hf to $base_model_dir"
+    fi
+fi
+
 
 # ------
 # Set environment variables for CUDA and library paths (after the env is installed)
@@ -105,13 +152,13 @@ if [ -z "$LIBCUDART_PATH" ]; then
     echo "WARNING: libcudart.so.12 not found in $CONDA_PREFIX"
 else
     echo "Found libcudart.so.12 at $LIBCUDART_PATH"
-    if [ ! -f "$CONDA_PREFIX/lib/libcudart.so" ]; then
+    if [ "$DRY_RUN" != "1" ] && [ ! -f "$CONDA_PREFIX/lib/libcudart.so" ]; then
         ln -s "$LIBCUDART_PATH" "$CONDA_PREFIX/lib/libcudart.so"
         echo "Created symlink $CONDA_PREFIX/lib/libcudart.so -> $LIBCUDART_PATH"
     fi
     # Also try to link in torch/lib if it exists, as that is in the linker path
     TORCH_LIB="$PYTHON_SITE_PACKAGES/torch/lib"
-    if [ -d "$TORCH_LIB" ] && [ ! -f "$TORCH_LIB/libcudart.so" ]; then
+    if [ "$DRY_RUN" != "1" ] && [ -d "$TORCH_LIB" ] && [ ! -f "$TORCH_LIB/libcudart.so" ]; then
         ln -s "$LIBCUDART_PATH" "$TORCH_LIB/libcudart.so"
         echo "Created symlink $TORCH_LIB/libcudart.so -> $LIBCUDART_PATH"
     fi
@@ -147,10 +194,10 @@ if [ "$DRY_RUN" != "1" ]; then
         data.train_batch_size=256 \
         data.max_prompt_length=4096 \
         data.max_response_length=4096 \
-        data.filter_overlong_prompts=True \
+        data.filter_overlong_prompts=False \
         data.truncation='error' \
         data.image_key=images \
-        actor_rollout_ref.model.path=$base_model_hf \
+        actor_rollout_ref.model.path=$base_model_dir \
         actor_rollout_ref.actor.optim.lr=3e-6 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.ppo_mini_batch_size=128 \
@@ -190,15 +237,12 @@ if [ "$DRY_RUN" != "1" ]; then
         trainer.validation_data_dir=$validation_data_dir \
         custom_reward_function.path=$reward_function_path \
         custom_reward_function.name=$reward_function_name \
+        +custom_reward_function.reward_kwargs.format_reward=$reward_format \
+        +custom_reward_function.reward_kwargs.composition=$reward_composition \
         +reward_model.use_reward_loop=True \
         data.custom_cls.path=$custom_cls_path \
         data.custom_cls.name=$custom_cls_name \
-        data.seed=1024 \
-        +data.temperature_sampler.enable=$temperature_sampler_enable \
-        +data.temperature_sampler.T=$temperature_sampler_T \
-        +data.temperature_sampler.task_key=ability \
-        "+data.temperature_sampler.task_group_map='medvision-angle:AD,medvision-distance:AD'" \
-        $@
+        "$@"
     train_status=$?
 else
     echo "(DRY_RUN) would run training: python3 -m verl.trainer.main_ppo with dataset_train=$dataset_train dataset_val=$dataset_val"

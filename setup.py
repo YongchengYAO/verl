@@ -38,7 +38,7 @@ install_requires = [
     "ray[default]>=2.41.0",
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
-    "transformers",
+    "transformers<5",  # 5.x metadata is unreadable by the pinned eval stack; see requirements.txt
     "wandb",
     "packaging>=20.0",
     "tensorboard",

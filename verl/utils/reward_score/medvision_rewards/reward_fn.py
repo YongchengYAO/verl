@@ -59,26 +59,6 @@ def exp_decay(x, k=1):
     return np.exp(-k * x)
 
 
-def extract_last_k_nums(text, k):
-    """
-    Parses the last k numbers from the given text.
-
-    Args:
-        text: Input text.
-        k: Number of numbers to retrieve.
-
-    Returns:
-        Comma-separated string of the last k numbers, or empty string if fewer than k found.
-    """
-    # Find all numbers in the text
-    numbers = re.findall(r"-?\d+\.?\d*", text)
-
-    # Return the last two numbers
-    if len(numbers) < k:
-        return ""
-    return ",".join(numbers[-k:])
-
-
 def cal_reward_from_error(error, reward_mapping_func="exp_decay"):
     """
     Calculates the reward based on the error and the specified mapping function.
@@ -234,31 +214,6 @@ def cal_ciou_reward_error(pred_box, gt_box, reward_mapping_func="exp_decay"):
     return cal_reward_from_error_or_zero(error, reward_mapping_func), error
 
 
-def cal_MAE_error(pred_float, gt_float):
-    """
-    Calculates the Mean Absolute Error (MAE).
-
-    Args:
-        pred_float: Predicted values.
-        gt_float: Ground truth values.
-
-    Returns:
-        The MAE, or NaN on length mismatch.
-    """
-    # Convert inputs to numpy arrays if they aren't already
-    try:
-        if not isinstance(pred_float, np.ndarray):
-            pred_float = np.array(pred_float)
-        if not isinstance(gt_float, np.ndarray):
-            gt_float = np.array(gt_float)
-    except Exception as e:
-        raise ValueError(f"Error converting model answer and GT to numpy array: {str(e)}") from e
-
-    if len(pred_float) != len(gt_float):
-        return float("nan")
-    return np.mean(np.abs(pred_float - gt_float))
-
-
 def _cal_norm_L2_dists(pred_xy_flat, gt_xy_flat):
     """
     Per-point normalized L2 distances for flat coordinate lists, or None on shape mismatch.
@@ -281,37 +236,12 @@ def _cal_norm_L2_dists(pred_xy_flat, gt_xy_flat):
     return dists
 
 
-def cal_norm_L2_error(pred_xy_flat, gt_xy_flat):
-    """
-    Mean normalized L2 distance for 2D point(s).
-
-    Inputs are flat coordinate lists in normalized [0, 1] image space:
-      - single point:  [x, y]
-      - two endpoints: [x1, y1, x2, y2]
-
-    For each (x, y) pair: dist = sqrt(dx^2 + dy^2) / sqrt(2).
-    Error = mean over all point pairs. Range: [0, 1].
-
-    Args:
-        pred_xy_flat: Predicted flat coordinate list.
-        gt_xy_flat: Ground truth flat coordinate list.
-
-    Returns:
-        The error, or NaN on shape mismatch.
-    """
-    dists = _cal_norm_L2_dists(pred_xy_flat, gt_xy_flat)
-    if dists is None:
-        return float("nan")
-    return float(np.mean(dists))
-
-
 def cal_norm_L2_max_error(pred_xy_flat, gt_xy_flat):
     """
     Max normalized L2 distance across 2D point(s).
 
-    Same as cal_norm_L2_error but aggregates per-point distances with max instead of mean.
-    For a single point the two functions are equivalent; for two endpoints this is stricter —
-    the error is determined by the worst-localized endpoint.
+    Per-point distances (sqrt(dx^2 + dy^2) / sqrt(2), in [0, 1]) aggregated with max: for two
+    endpoints the error is determined by the worst-localized endpoint.
 
     Args:
         pred_xy_flat: Predicted flat coordinate list.
@@ -324,83 +254,3 @@ def cal_norm_L2_max_error(pred_xy_flat, gt_xy_flat):
     if dists is None:
         return float("nan")
     return float(np.max(dists))
-
-
-def cal_MRE_reward(
-    pred_float,
-    gt_float,
-    reward_mapping_func="exp_decay",
-):
-    """
-    Calculates the Mean Relative Error (MRE) reward.
-
-    Args:
-        pred_float: Predicted values.
-        gt_float: Ground truth values.
-        reward_mapping_func: Reward mapping function name.
-
-    Returns:
-        The calculated reward (0.0 on length mismatch).
-    """
-    return cal_reward_from_error_or_zero(cal_MRE_error(pred_float, gt_float), reward_mapping_func)
-
-
-def cal_MAE_reward(
-    pred_float,
-    gt_float,
-    reward_mapping_func="exp_decay",
-):
-    """
-    Calculates the Mean Absolute Error (MAE) reward.
-
-    Args:
-        pred_float: Predicted values.
-        gt_float: Ground truth values.
-        reward_mapping_func: Reward mapping function name.
-
-    Returns:
-        The calculated reward (0.0 on length mismatch).
-    """
-    return cal_reward_from_error_or_zero(cal_MAE_error(pred_float, gt_float), reward_mapping_func)
-
-
-def cal_norm_L2_reward(
-    pred_xy_flat,
-    gt_xy_flat,
-    reward_mapping_func="exp_decay",
-):
-    """
-    Reward based on mean normalized L2 distance for 2D point(s).
-
-    See cal_norm_L2_error for the error definition.
-
-    Args:
-        pred_xy_flat: Predicted flat coordinate list.
-        gt_xy_flat: Ground truth flat coordinate list.
-        reward_mapping_func: Reward mapping function name.
-
-    Returns:
-        The calculated reward (0.0 on shape mismatch).
-    """
-    return cal_reward_from_error_or_zero(cal_norm_L2_error(pred_xy_flat, gt_xy_flat), reward_mapping_func)
-
-
-def cal_norm_L2_max_reward(
-    pred_xy_flat,
-    gt_xy_flat,
-    reward_mapping_func="exp_decay",
-):
-    """
-    Reward based on max normalized L2 distance across 2D point(s).
-
-    See cal_norm_L2_max_error for the error definition.
-
-    Args:
-        pred_xy_flat: Predicted flat coordinate list.
-        gt_xy_flat: Ground truth flat coordinate list.
-        reward_mapping_func: Reward mapping function name.
-
-    Returns:
-        The calculated reward (0.0 on shape mismatch).
-    """
-    return cal_reward_from_error_or_zero(cal_norm_L2_max_error(pred_xy_flat, gt_xy_flat), reward_mapping_func)

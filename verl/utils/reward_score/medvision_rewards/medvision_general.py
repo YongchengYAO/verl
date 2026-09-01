@@ -12,464 +12,171 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
+"""Multi-task reward for MedVision RFT (GRPO): one configurable entry point, ``compute_score``.
 
-from verl.utils.reward_score.medvision_rewards.medvision_ad import (
-    cal_process_reward_error_v2 as cal_ad_process_reward_error_v2,
-)
-from verl.utils.reward_score.medvision_rewards.medvision_ad import (
-    cal_process_reward_error_v3 as cal_ad_process_reward_error_v3,
-)
-from verl.utils.reward_score.medvision_rewards.medvision_tl import (
-    cal_process_reward_error_v2 as cal_tl_process_reward_error_v2,
-)
-from verl.utils.reward_score.medvision_rewards.medvision_tl import (
-    cal_process_reward_error_v3 as cal_tl_process_reward_error_v3,
-)
+    r = r_format + r_process * r_answer     composition="multiplicative" (default)
+    r = r_format + r_process + r_answer     composition="additive"
+
+Components, each in [0, 1]:
+
+* ``r_format`` -- ``"soft"`` (default): 0.8 * reasoning-structure score + 0.2 * binary ``<answer>``
+  format check; ``"binary"``: the ``<answer>`` check alone. Detection has no CoT steps and always
+  uses the binary check.
+* ``r_process`` -- mean over the CoT steps of ``rho(step error)``: worst-point localization error
+  for landmark / endpoint steps, relative error for measurement steps (A/D and T/L only; detection
+  has no process reward, so its score is ``r_format + r_answer``).
+* ``r_answer`` -- ``rho(mean relative error)`` of the ``<answer>`` values (A/D, T/L) or
+  ``rho((1 - CIoU) / 2)`` of the predicted box (detection). ``rho(e) = exp(-e)`` by default.
+
+Selected from a recipe through verl's custom reward function config::
+
+    custom_reward_function.path=.../medvision_general.py custom_reward_function.name=compute_score
+    +custom_reward_function.reward_kwargs.format_reward=soft          # soft | binary
+    +custom_reward_function.reward_kwargs.composition=multiplicative  # multiplicative | additive
+
+Every call returns the same keys (``score``, the three components, and the raw errors
+``answer_error`` / ``localization_error`` / ``measurement_error``, NaN where not applicable), as
+required by the reward loop and consumed by the curriculum (``answer_error``).
+"""
+
+from verl.utils.reward_score.medvision_rewards import medvision_ad, medvision_tl
+from verl.utils.reward_score.medvision_rewards.parsing import match_answer, parse_answer, parse_ground_truth
 from verl.utils.reward_score.medvision_rewards.reward_fn import (
     cal_ciou_reward_error,
     cal_MRE_error,
     cal_reward_from_error_or_zero,
-    extract_last_k_nums,
 )
 
-# All supported abilities; all except detection have process (CoT step) rewards
 ABILITIES = ["medvision-tl", "medvision-angle", "medvision-distance", "medvision-detection"]
+NUM_ANSWER_VALUES = {"medvision-tl": 2, "medvision-angle": 1, "medvision-distance": 1, "medvision-detection": 4}
+# Tasks with CoT steps (process reward + soft format score) and the module implementing them.
+PROCESS_MODULES = {"medvision-tl": medvision_tl, "medvision-angle": medvision_ad, "medvision-distance": medvision_ad}
+FORMAT_REWARD_VARIANTS = ("soft", "binary")
+COMPOSITIONS = ("multiplicative", "additive")
+SOFT_FORMAT_ALPHA = 0.8  # weight of the reasoning-structure score in the soft format reward
 
 
-def build_error_info(answer_error, localization_error=None, measurement_error=None):
-    """
-    Builds the error-logging dict with a FIXED key set regardless of ability.
-
-    A fixed key set is required because the reward loop takes the key list from the
-    first sample of a batch and indexes every sample with it
-    (see verl/experimental/reward_loop/reward_loop.py).
-
-    Keys:
-      - answer_error: MRE of the final answer, shared across all tasks
-      - if process errors are given: localization_error / measurement_error,
-        shared across AD and TL (normalized L2 and MRE definitions are consistent
-        across these tasks); NaN for detection, whose localization is already
-        captured by its answer error
-
-    NaN values are excluded by the np.nanmean aggregation during multi-task training.
-
-    Args:
-        answer_error: MRE of the final answer (NaN if unparseable).
-        localization_error: Localization error of the CoT steps (None to omit process keys).
-        measurement_error: Measurement error of the CoT steps (None to omit process keys).
-
-    Returns:
-        A dict of error metrics.
-    """
-    nan = float("nan")
-    info = {"answer_error": answer_error}
-
-    if localization_error is not None or measurement_error is not None:
-        info["localization_error"] = nan if localization_error is None else localization_error
-        info["measurement_error"] = nan if measurement_error is None else measurement_error
-
-    return info
-
-
-# Tag helpers: strict tags (no spaces inside <>), flexible spaces between structures
-def tag(name):
-    return rf"<{name}>"
-
-
-def end(name):
-    return rf"</{name}>"
-
-
-def get_answer_pattern_k_values(num_target_values):
-    """
-    Returns a regex pattern for answer with num_target_values values.
-    """
-    # Patterns for answer extraction and format checking
-    PATTERN_NON_NEG_REAL = r"\d+(?:\.\d+)?"
-    PATTERN_NON_NEG_REAL_GROUP = rf"({PATTERN_NON_NEG_REAL})"
-
-    values = ",".join([f"\s*{PATTERN_NON_NEG_REAL}\s*" for _ in range(num_target_values)])
-    pattern = rf"\s*{tag('answer')}\s*{values}\s*{end('answer')}\s*"
-
-    values_group = ",".join([f"\s*{PATTERN_NON_NEG_REAL_GROUP}\s*" for _ in range(num_target_values)])
-    pattern_group = rf"\s*{tag('answer')}\s*{values_group}\s*{end('answer')}\s*"
-    return pattern, pattern_group
-
-
-def match_answer(content, num_target_values):
-    """
-    Return 1 if <answer> block matches required format (case-sensitive, flexible spacing), else 0.
-
-    Examples of valid formats (case-sensitive) for tasks with 2 target values:
-        "<answer> (3, 5) </answer>"
-        "<answer>(10,20)</answer>"
-        "<answer> ( 0 , 0.5 ) </answer>"
-
-    Args:
-        content: The content string to evaluate.
-
-    Returns:
-        1 if the format matches, 0 otherwise.
-    """
-    # Remove leading/trailing spaces and brackets from content
-    content_clean = content.strip()
-    content_clean = re.sub(r"^[\[\{\(\s]+", "", content_clean)
-    content_clean = re.sub(r"[\]\}\)\s]+$", "", content_clean)
-    pattern = get_answer_pattern_k_values(num_target_values)[0]
-    return 1 if re.search(pattern, content_clean, re.VERBOSE) else 0
-
-
-def _to_float(*gs):
-    return tuple(float(x) for x in gs)
-
-
-def cal_format_reward(solution, **kwargs):
-    """
-    Reward function that checks if the model response has a specific format.
-
-    Args:
-        solution: model responses (text)
-
-    Returns:
-        a scalar reward
-    """
-    # Validate ability and determine number of target values based on ability
+def _ability(kwargs):
     ability = kwargs.get("ability")
-    assert ability in ABILITIES, f"[Error] ability should be one of {ABILITIES}, but got {ability}."
-    if ability in ["medvision-tl"]:
-        num_target_values = 2
-    elif ability in ["medvision-angle", "medvision-distance"]:
-        num_target_values = 1
-    elif ability in ["medvision-detection"]:
-        num_target_values = 4
+    assert ability in ABILITIES, f"[Error] ability should be one of {ABILITIES}, but got {ability!r}."
+    return ability
 
-    # Check format using regex pattern matching
-    answer_format_reward = match_answer(solution, num_target_values)
 
-    return answer_format_reward
+def cal_format_reward(solution, format_reward="soft", **kwargs):
+    """
+    Format reward in [0, 1].
+
+    Args:
+        solution: model response (text).
+        format_reward: "soft" (0.8 * reasoning-structure score + 0.2 * binary answer check) or
+            "binary" (answer check only). Detection always uses the binary check.
+        kwargs: ``extra_info`` of the sample (``ability``, ``metric_type``, ...).
+    """
+    ability = _ability(kwargs)
+    assert format_reward in FORMAT_REWARD_VARIANTS, (
+        f"[Error] format_reward should be one of {FORMAT_REWARD_VARIANTS}, but got {format_reward!r}."
+    )
+    answer_ok = match_answer(solution, NUM_ANSWER_VALUES[ability])
+    if format_reward == "binary" or ability not in PROCESS_MODULES:
+        return answer_ok
+    structure = PROCESS_MODULES[ability].match_reasoning(solution, **kwargs)
+    return SOFT_FORMAT_ALPHA * structure + (1 - SOFT_FORMAT_ALPHA) * answer_ok
 
 
 def cal_answer_reward_error(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
     """
-    Calculates the answer reward and raw error from the extracted final answer of the
-    model response (solution). The error metric depends on the task: A/D and T/L use MRE
-    (Mean Relative Error) over the scalar/axis-length answer, while detection uses the
-    CIoU overlap error (1 - CIoU) / 2 over the 4 box coordinates.
-
-    Args:
-        solution: model responses (text)
-        ground_truth: ground truth strings
-        reward_mapping_func: Reward mapping function name.
+    Answer reward and raw answer error of the final ``<answer>``: mean relative error for A/D and
+    T/L, CIoU overlap error ``(1 - CIoU) / 2`` for detection.
 
     Returns:
-        A tuple (reward, answer_error): for A/D and T/L answer_error is the MRE; for
-        detection it is the CIoU overlap error (NaN if the answer is unparseable).
+        (reward, error); ``(0.0, NaN)`` when the answer cannot be parsed.
     """
-    # Validate ability and determine number of target values based on ability
-    ability = kwargs.get("ability")
-    assert ability in ABILITIES, f"[Error] ability should be one of {ABILITIES}, but got {ability}."
-    if ability in ["medvision-tl"]:
-        num_target_values = 2
-    elif ability in ["medvision-angle", "medvision-distance"]:
-        num_target_values = 1
-    elif ability in ["medvision-detection"]:
-        num_target_values = 4
-    pattern_group = get_answer_pattern_k_values(num_target_values)[1]
-
-    # Extract ground truth coordinates
-    gt_string = ground_truth.strip()
-    gt_parts = [
-        part.strip()
-        for part in gt_string.replace("(", "").replace(")", "").replace("[", "").replace("]", "").split(",")
-    ]
-    gt_float = [float(part) for part in gt_parts if part]
-    num_gt = len(gt_float)
-
-    # Sanity check to ensure the number of extracted ground truth values matches expected number based on ability
-    assert num_gt == num_target_values, (
-        f"[Error] The number of target values extracted from ground truth ({num_gt}) does not match "
-        f"expected number based on ability ({num_target_values}). Please check the format of the "
-        "ground truth and ensure it contains the correct number of values."
+    ability = _ability(kwargs)
+    num_values = NUM_ANSWER_VALUES[ability]
+    gt = parse_ground_truth(ground_truth)
+    assert len(gt) == num_values, (
+        f"[Error] ground truth {ground_truth!r} has {len(gt)} values; {ability} expects {num_values}."
     )
-
-    # Extract predicted values
-    try:
-        # Directly extract specified number of values using GROUP pattern
-        pattern_answer = re.compile(pattern_group, re.DOTALL)
-        ma = pattern_answer.search(solution)
-        pred_float = list(_to_float(*ma.groups()))
-    except Exception:
-        try:
-            # Extract content within <answer>...</answer> and parse last num_gt numbers
-            pattern_answer = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
-            ma = pattern_answer.search(solution)
-            answer_content = ma.group(1).strip()
-            # Parse prediction string to extract num_gt numbers
-            pred_string_parsed = extract_last_k_nums(
-                answer_content, num_gt
-            )  # returns a string with num_gt numbers seperated by comma or empty string
-            pred_parts = [
-                part.strip()
-                for part in pred_string_parsed.replace("(", "")
-                .replace(")", "")
-                .replace("[", "")
-                .replace("]", "")
-                .split(",")
-            ]
-            pred_float = [float(part) for part in pred_parts if part]
-            if len(pred_float) != num_gt:
-                return 0.0, float("nan")
-        except Exception:
-            return 0.0, float("nan")
-
-    # Compute the answer reward/error. Detection scores the 4 box coordinates with CIoU
-    # (overlap-aware and position/scale-fair, unlike coordinate MRE which is biased toward
-    # the origin); the returned answer_error is the overlap error (1 - CIoU) / 2. A/D and
-    # T/L keep MRE over their scalar/axis-length answers.
+    pred = parse_answer(solution, num_values)
+    if pred is None:
+        return 0.0, float("nan")
     if ability == "medvision-detection":
-        return cal_ciou_reward_error(pred_float, gt_float, reward_mapping_func)
-
-    error = cal_MRE_error(pred_float, gt_float)
-    reward = cal_reward_from_error_or_zero(error, reward_mapping_func)
-
-    return reward, error
+        return cal_ciou_reward_error(pred, gt, reward_mapping_func)
+    error = cal_MRE_error(pred, gt)
+    return cal_reward_from_error_or_zero(error, reward_mapping_func), error
 
 
-def cal_answer_reward(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+def cal_process_reward_error(solution, ground_truth, reward_mapping_func="exp_decay", **kwargs):
+    """(reward, localization_error, measurement_error) of the CoT steps (A/D and T/L only)."""
+    ability = _ability(kwargs)
+    assert ability in PROCESS_MODULES, f"[Error] {ability} has no process reward."
+    return PROCESS_MODULES[ability].cal_process_reward_error(solution, ground_truth, reward_mapping_func, **kwargs)
+
+
+def build_error_info(answer_error, localization_error=None, measurement_error=None):
     """
-    Calculates the answer reward (see cal_answer_reward_error).
-
-    Returns:
-        a scalar reward
+    Error-logging dict with a FIXED key set regardless of ability: the reward loop takes the key
+    list from the first sample of a batch and indexes every sample with it
+    (verl/experimental/reward_loop/reward_loop.py), so non-applicable values are NaN, never
+    omitted. The trainer aggregates them with NaN-aware means.
     """
-    return cal_answer_reward_error(solution, ground_truth, reward_mapping_func, **kwargs)[0]
+    nan = float("nan")
+    info = {"answer_error": answer_error}
+    if localization_error is not None or measurement_error is not None:
+        info["localization_error"] = nan if localization_error is None else localization_error
+        info["measurement_error"] = nan if measurement_error is None else measurement_error
+    return info
 
 
-def compute_score_exp_decay(
+def compute_score(
     data_source,
     solution_str,
     ground_truth,
     extra_info,
+    format_reward="soft",
+    composition="multiplicative",
+    reward_mapping_func="exp_decay",
 ):
     """
-    Computes the scores for the given solution against the ground truth.
+    Reward of one rollout (see the module docstring for the formula).
 
     Args:
-        data_source: The source of the data.
-        solution_str: The solution (completions).
-        ground_truth: The ground truth.
-        extra_info: Extra information for reward calculation.
+        data_source: unused (verl custom-reward signature).
+        solution_str: model response (text).
+        ground_truth: ground-truth answer string.
+        extra_info: per-sample metadata; must contain ``ability`` (injected by the reward manager),
+            plus ``metric_type`` and the ground-truth landmarks for A/D and T/L.
+        format_reward: "soft" (default) or "binary".
+        composition: "multiplicative" (default) or "additive" combination of process and answer rewards.
+        reward_mapping_func: error-to-reward map ("exp_decay" default, "scaled_sigmoid", "gaussian_proxy").
 
     Returns:
-        A dictionary containing the calculated rewards.
+        dict with ``score`` (training reward), ``format_reward``, ``process_reward``,
+        ``answer_reward``, ``answer_error``, ``localization_error``, ``measurement_error``.
     """
     assert extra_info is not None, (
-        "[Error] extra_info cannot be None since we have injected the filed 'ability' into "
-        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
+        "[Error] extra_info cannot be None: the reward manager injects 'ability' into extra_info "
+        "(see workers/reward_manager/naive.py and experimental/reward_loop/reward_manager/naive.py)."
     )
+    assert composition in COMPOSITIONS, f"[Error] composition should be one of {COMPOSITIONS}, but got {composition!r}."
+    ability = _ability(extra_info)
 
-    format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward, answer_error = cal_answer_reward_error(
-        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
-    )
-    reward = format_reward + answer_reward
+    f = cal_format_reward(solution_str, format_reward=format_reward, **extra_info)
+    a, answer_error = cal_answer_reward_error(solution_str, ground_truth, reward_mapping_func, **extra_info)
 
-    return {
-        "score": reward,
-        "format_reward": format_reward,
-        "answer_reward": answer_reward,
-        **build_error_info(answer_error),
-    }
-
-
-def compute_score_scaled_sigmoid(
-    data_source,
-    solution_str,
-    ground_truth,
-    extra_info,
-):
-    """
-    Computes the scores for the given solution against the ground truth.
-
-    Args:
-        data_source: The source of the data.
-        solution_str: The solution (completions).
-        ground_truth: The ground truth.
-        extra_info: Extra information for reward calculation.
-
-    Returns:
-        A dictionary containing the calculated rewards.
-    """
-    assert extra_info is not None, (
-        "[Error] extra_info cannot be None since we have injected the filed 'ability' into "
-        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
-    )
-
-    format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward, answer_error = cal_answer_reward_error(
-        solution_str, ground_truth, reward_mapping_func="scaled_sigmoid", **extra_info
-    )
-    reward = format_reward + answer_reward
-
-    return {
-        "score": reward,
-        "format_reward": format_reward,
-        "answer_reward": answer_reward,
-        **build_error_info(answer_error),
-    }
-
-
-def compute_score_gaussian_proxy(
-    data_source,
-    solution_str,
-    ground_truth,
-    extra_info,
-):
-    """
-    Computes the scores for the given solution against the ground truth.
-
-    Args:
-        data_source: The source of the data.
-        solution_str: The solution (completions).
-        ground_truth: The ground truth.
-        extra_info: Extra information for reward calculation.
-
-    Returns:
-        A dictionary containing the calculated rewards.
-    """
-    assert extra_info is not None, (
-        "[Error] extra_info cannot be None since we have injected the filed 'ability' into "
-        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
-    )
-
-    format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward, answer_error = cal_answer_reward_error(
-        solution_str, ground_truth, reward_mapping_func="gaussian_proxy", **extra_info
-    )
-    reward = format_reward + answer_reward
-
-    return {
-        "score": reward,
-        "format_reward": format_reward,
-        "answer_reward": answer_reward,
-        **build_error_info(answer_error),
-    }
-
-
-def compute_score_exp_decay_PRxAnswer_v2(
-    data_source,
-    solution_str,
-    ground_truth,
-    extra_info,
-):
-    """
-    Multi-task PRxAnswer reward using mean normalized L2 process reward for AD and TL.
-
-    Routes process reward based on ability:
-      - medvision-tl:              format + TL_process_v2 * answer
-      - medvision-angle/distance:  format + AD_process_v2 * answer
-      - medvision-detection:       format + answer  (no process reward)
-
-    Args:
-        data_source: The source of the data.
-        solution_str: The solution (completions).
-        ground_truth: The ground truth.
-        extra_info: Extra information including the 'ability' field.
-
-    Returns:
-        A dictionary containing the calculated rewards.
-    """
-    assert extra_info is not None, (
-        "[Error] extra_info cannot be None since we have injected the field 'ability' into "
-        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
-    )
-
-    ability = extra_info.get("ability")
-    format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward, answer_error = cal_answer_reward_error(
-        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
-    )
-
-    if ability == "medvision-tl":
-        process_reward, localization_error, measurement_error = cal_tl_process_reward_error_v2(
-            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
+    if ability in PROCESS_MODULES:
+        p, localization_error, measurement_error = cal_process_reward_error(
+            solution_str, ground_truth, reward_mapping_func, **extra_info
         )
-        score = format_reward + process_reward * answer_reward
-    elif ability in ["medvision-angle", "medvision-distance"]:
-        process_reward, localization_error, measurement_error = cal_ad_process_reward_error_v2(
-            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
-        )
-        score = format_reward + process_reward * answer_reward
+        task_term = p * a if composition == "multiplicative" else p + a
     else:
-        # medvision-detection: no process reward
-        process_reward = 0.0
-        localization_error = measurement_error = float("nan")
-        score = format_reward + answer_reward
+        p, localization_error, measurement_error = 0.0, float("nan"), float("nan")
+        task_term = a
 
     return {
-        "score": score,
-        "format_reward": format_reward,
-        "process_reward": process_reward,
-        "answer_reward": answer_reward,
-        **build_error_info(answer_error, localization_error, measurement_error),
-    }
-
-
-def compute_score_exp_decay_PRxAnswer_v3(
-    data_source,
-    solution_str,
-    ground_truth,
-    extra_info,
-):
-    """
-    Multi-task PRxAnswer reward using max normalized L2 process reward for AD and TL.
-
-    Routes process reward based on ability:
-      - medvision-tl:              format + TL_process_v3 * answer
-      - medvision-angle/distance:  format + AD_process_v3 * answer
-      - medvision-detection:       format + answer  (no process reward)
-
-    Args:
-        data_source: The source of the data.
-        solution_str: The solution (completions).
-        ground_truth: The ground truth.
-        extra_info: Extra information including the 'ability' field.
-
-    Returns:
-        A dictionary containing the calculated rewards.
-    """
-    assert extra_info is not None, (
-        "[Error] extra_info cannot be None since we have injected the field 'ability' into "
-        "extra_info in workers/reward_manager/naive.py. Please check the code there for details."
-    )
-
-    ability = extra_info.get("ability")
-    format_reward = cal_format_reward(solution_str, **extra_info)
-    answer_reward, answer_error = cal_answer_reward_error(
-        solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
-    )
-
-    if ability == "medvision-tl":
-        process_reward, localization_error, measurement_error = cal_tl_process_reward_error_v3(
-            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
-        )
-        score = format_reward + process_reward * answer_reward
-    elif ability in ["medvision-angle", "medvision-distance"]:
-        process_reward, localization_error, measurement_error = cal_ad_process_reward_error_v3(
-            solution_str, ground_truth, reward_mapping_func="exp_decay", **extra_info
-        )
-        score = format_reward + process_reward * answer_reward
-    else:
-        # medvision-detection: no process reward
-        process_reward = 0.0
-        localization_error = measurement_error = float("nan")
-        score = format_reward + answer_reward
-
-    return {
-        "score": score,
-        "format_reward": format_reward,
-        "process_reward": process_reward,
-        "answer_reward": answer_reward,
+        "score": f + task_term,
+        "format_reward": f,
+        "process_reward": p,
+        "answer_reward": a,
         **build_error_info(answer_error, localization_error, measurement_error),
     }

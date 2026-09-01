@@ -1,5 +1,6 @@
 # Curriculum Sample Filtering (Online Hard-Example Mining)
 
+
 Epoch-level sample filtering for GRPO RFT: samples the policy reliably solves are
 progressively removed from training so each epoch concentrates rollout compute on the
 cases the model still gets wrong, with a retention mix-in of solved samples that ramps
@@ -12,7 +13,12 @@ per-sample `answer_error`.
 - Core logic: [`verl/utils/dataset/curriculum.py`](./verl/utils/dataset/curriculum.py)
 - Dataset hooks: [`verl/utils/dataset/medvision_dataset.py`](./verl/utils/dataset/medvision_dataset.py)
 - Trainer integration: [`verl/trainer/ppo/ray_trainer.py`](./verl/trainer/ppo/ray_trainer.py)
-- Example recipe: [`examples/grpo_trainer/train__fullRFT__qwen25vl-7b-fullSFT__multiTask__512x512__PRxAnswer__curriculum__H200.sh`](./examples/grpo_trainer/train__fullRFT__qwen25vl-7b-fullSFT__multiTask__512x512__PRxAnswer__curriculum__H200.sh)
+- Example recipes: [`train__rft-multitask.sh`](./examples/grpo_trainer/train__rft-multitask.sh)
+  (the paper's multi-task RFT ablation) and its additive-reward twin
+  [`train__rft-multitask__additive-reward.sh`](./examples/grpo_trainer/train__rft-multitask__additive-reward.sh)
+- Pool visualization: [`examples/grpo_trainer/curriculum-learning/plot_curriculum_pools.py`](./examples/grpo_trainer/curriculum-learning/plot_curriculum_pools.py)
+- Paper: Algorithm 3 of [MedVision](https://arxiv.org/abs/2511.18676) — see
+  [Correspondence with the paper](#correspondence-with-the-paper-algorithm-3)
 - Unit tests: [`tests/utils/dataset/test_curriculum_on_cpu.py`](./tests/utils/dataset/test_curriculum_on_cpu.py)
 
 ---
@@ -39,6 +45,16 @@ Pools are tracked **per task** (task = `ability` column, optionally merged via
 
 - `hard[t]` — samples still being trained (initially all of them)
 - `easy[t]` — samples classified as solved, ordered by promotion recency
+
+```
+                promote (top-k by EMA score, gated on error + pass-streak)
+      hard[t]  ────────────────────────────────────────────────────────▶  easy[t]
+         ▲                                                                  │
+         │           demote (failed audit + regressed past hysteresis)      │
+         └──────────────────────────────────────────────────────────────────┘
+
+  next epoch's training set  =  hard[t]  +  retention mix-in  +  audit slice  +  task floor
+```
 
 During each epoch, every training step tallies, per sample index, the rollout-level
 `score` (sequence reward = `token_level_scores.sum(-1)`, i.e. pre-KL) and
@@ -238,6 +254,10 @@ the temperature sampler — the structured `algorithm` config is not touched):
 | `+data.curriculum.task_key` | `ability` | Dataset column used for per-task pooling |
 | `+data.curriculum.task_group_map` | `""` | `label:group` merges, e.g. `'medvision-angle:AD,medvision-distance:AD'` |
 
+The two multi-task recipes ([`train__rft-multitask.sh`](./examples/grpo_trainer/train__rft-multitask.sh)
+and its additive-reward twin) run exactly these documented defaults, each passed explicitly as a
+`+data.curriculum.*` override.
+
 Minimal launch addition:
 
 ```bash
@@ -380,6 +400,18 @@ ds = datasets.load_dataset(
 row = ds[4711]  # -> row["ability"], row["extra_info"], the prompt, ...
 ```
 
+Visualize a run's pools with the companion script:
+
+```bash
+python examples/grpo_trainer/curriculum-learning/plot_curriculum_pools.py \
+    --pool_dir <run_dir>/curriculum_pools \
+    --mre_gate 0.10 --detection_gate 0.25
+```
+
+It renders three panels — per-task sample fate (mastered / hard-evaluated / hard-never-drawn,
+with the gate marked), the training set handed to each epoch (hard / mix-in / audit), and
+per-task EMA-error distributions vs. the gate — to `<run_dir>/curriculum_figures/`.
+
 Example — plot pool sizes and the easy-pool EMA-MRE distribution over epochs:
 
 ```python
@@ -455,11 +487,60 @@ ZPD-style selection), with three deliberate differences:
    experience-replay ratios and rehearsal buffers used to limit catastrophic
    forgetting in continual learning.
 
+## Correspondence with the paper (Algorithm 3)
+
+The curriculum is Algorithm 3 of the MedVision paper (Appendix *Epoch-Level Curriculum Learning
+for Multi-Task RFT*, [arXiv:2511.18676](https://arxiv.org/abs/2511.18676)). Its symbols map onto
+the `+data.curriculum.*` options as follows (values = the paper's runs = the recipe defaults):
+
+| Paper | Meaning | Here | Value |
+|---|---|---|---|
+| `H_t`, `E_t` | hard / easy pool of task `t` | `hard[t]`, `easy[t]` | — |
+| `S_t` | active (training) set of task `t` | `active_t = hard ∪ mix-in ∪ audit` (+ floor top-up) | — |
+| `D_t^(k)` | samples of task `t` drawn in epoch `k` | the epoch tally (samples with ≥ 1 rollout) | — |
+| `r̄_i`, `ē_i` | EMA reward / EMA answer error | `stats[idx] = [ema_score, ema_mre, …]` | — |
+| `c_i⁺`, `c_i⁻` | consecutive passing / failing observed epochs | `pass_streak`, `fail_streak` | — |
+| `g_t` | error threshold | `mre_gate` (A/D, T/L) / `detection_gate` (detection) | 0.10 / 0.25 |
+| `f` | promotion fraction | `easy_top_frac` | 0.20 |
+| `m` | maximum mix-in share | `mixin_easy_frac` | 0.30 |
+| `p*` | solved fraction at which the mix-in is at full strength | `threshold_frac` | 0.50 |
+| `λ` | demotion hysteresis margin | `demote_margin` | 1.5 |
+| `a` | audit fraction (of the hard pool) | `audit_frac` | 0.05 |
+| `φ` | per-task minimum active fraction | `task_floor_frac` | 0.10 |
+| `α` | EMA weight | `ema_alpha` | 0.4 |
+| `ν⁺`, `ν⁻` | required passing / failing epochs | `promote_patience`, `demote_patience` | 1, 1 |
+| `T` | mixing temperature (Appendix *Temperature-Scaled Task Mixing*) | `+data.temperature_sampler.T` | 8 |
+| task grouping | angle + distance merged into A/D | `task_key=ability`, `task_group_map='medvision-angle:AD,medvision-distance:AD'` (sampler and curriculum) | — |
+
+`demote_easy=True` and `mixin_ramp=True` are the paper's behavior; their `False` branches
+(sticky easy pool; binary phase flip at `p*`) are unreported alternatives.
+
+**Implementation details not spelled out in the pseudo-code** (the appendix prose describes the
+implemented behavior):
+
+- *EMA seeding.* A sample's first observation sets `ē_i` and `r̄_i` directly; the update
+  `ē ← α·e + (1−α)·ē` applies from its second observed epoch on. (A literal reading of
+  Algorithm 3 with EMAs initialized at 0 would let a first-epoch error `e < g_t/α` pass the
+  gate; the implementation requires `e < g_t`, matching the prose "one qualifying epoch is
+  formally sufficient".)
+- *Epoch means over parsed rollouts.* The mean answer error of a sample is taken over its
+  rollouts that parsed; an epoch in which none parsed leaves `ē_i` unchanged but counts as a
+  failing epoch (`c_i⁻`), and a NaN `ē_i` satisfies the demotion test.
+- *Demotion candidates.* Every easy sample drawn in the epoch is a demotion candidate — the
+  mix-in and audit sets `M_t ∪ A_t` plus the easy samples re-activated by the per-task floor
+  and by the global floor below — since those are exactly the easy samples with fresh rollouts.
+- *Global floor.* The union of the active sets is kept at ≥ one generation batch
+  (`data.gen_batch_size`, else `data.train_batch_size`), so `drop_last=True` cannot produce a
+  zero-step epoch.
+- *Rounding and seeding.* The promotion cap is `floor(f·|S_t|)`; rebuilt per-epoch samplers are
+  seeded with `data.seed + epoch`.
+
 ## Implementation notes
 
 - `CurriculumManager` is pure Python (no torch/numpy state) and fully unit-tested on
-  CPU: `python -m pytest tests/utils/dataset/test_curriculum_on_cpu.py` (35 tests,
-  including exact-equivalence pins for the legacy single-epoch mode).
+  CPU: `python -m pytest tests/utils/dataset/test_curriculum_on_cpu.py` (51 tests,
+  including exact-equivalence pins for the legacy single-epoch mode, the per-task gate,
+  and the pool snapshots).
 - The per-step tally hooks into the pre-existing `train_dataset.on_batch_end(batch)`
   call in the trainer loop; with the flag off, the trainer behaves byte-identically
   (no manager is constructed, the stock dataloader code path is used, and
