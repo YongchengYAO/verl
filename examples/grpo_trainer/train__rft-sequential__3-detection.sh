@@ -5,11 +5,11 @@
 # Settings:
 #   experiment ....... MedVision-V0 stage 3: detection RFT -> MedVision-V0 (the paper's model is global_step_250 of this stage)
 #   base model ....... stage 2's checkpoints/<EXP_NAME>/global_step_<N>/actor/merged_hf_model
-#   dataset variant .. ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512 (1M detection set, shards/)
+#   dataset variant .. ds__AD0_D110000_TL0_all110000__resized-hw-512x512 (110K detection set, shards/)
 #   reward ........... format_reward=soft, composition=multiplicative
 #
 # Usage:
-#   DATASET_ROOT=<data_dir>/verl_datasets/qwen25vl/ds__AD0_D1000000_TL0_all1000000__resized-hw-512x512 \
+#   DATASET_ROOT=<data_dir>/verl_datasets/qwen25vl/ds__AD0_D110000_TL0_all110000__resized-hw-512x512 \
 #   BASE_MODEL_PATH=examples/grpo_trainer/checkpoints/rft-sequential__2-TL/global_step_<N>/actor/merged_hf_model \
 #   bash examples/grpo_trainer/train__rft-sequential__3-detection.sh
 #
